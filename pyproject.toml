@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "darts-model"
+version = "0.1.0"
+description = "Dart and dartboard detection trained on a procedural Vulkan renderer"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "lightning>=2.0",
+    "tensorboard>=2.14",
+    "albumentations>=1.4",
+    "numpy>=1.24",
+    "scipy>=1.9",
+    "pyyaml>=6.0",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.5"]
+coreml = ["coremltools>=8.0"]
+litert = ["litert-torch", "ai-edge-litert"]
+# Regenerating renderer/assets. Not needed to train: the assets are committed.
+assets = ["fonttools>=4.0", "mapbox-earcut>=1.0", "pillow>=10.0"]
+dev = ["pytest>=7.0", "ruff>=0.5"]
+
+[project.scripts]
+darts-pretrain = "darts_model.cli.pretrain:main"
+darts-train = "darts_model.cli.train:main"
+darts-promote-backbone = "darts_model.cli.promote_backbone:main"
+darts-visualize = "darts_model.cli.visualize:main"
+darts-export-coreml = "darts_model.export.coreml:main"
+darts-export-litert = "darts_model.export.litert:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+extend-exclude = ["build", "build_*"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501", "E702"]

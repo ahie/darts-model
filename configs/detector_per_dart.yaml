@@ -1,0 +1,152 @@
+# Fine-tune of the stride-8 detector with the per-dart readout added
+# (model/instance.py): the embedding groups each dart's cells, and an
+# attention head reads all of them to place the landing point.
+#
+#   darts-train --config configs/detector_per_dart.yaml
+#
+# Starts from every weight of a configs/detector_embed.yaml run, whose
+# embedding already separates the darts; the per-dart head and its token
+# projection are the only freshly initialised parts. Checkpoints rank on the
+# per-dart readout; both Hough readouts and the per-dart readout from
+# ground-truth seeds are logged alongside.
+#
+# Outputs, per stride-8 cell: a dart foreground score and that dart's oriented
+# box, landing point and flight end; plus the 40 double-ring corners of the
+# board. Darts are read out by Hough voting over the foreground cells.
+#
+# On one RTX 5090: ~6 min per epoch, about 10 hours for 100.
+
+backbone:
+  backbone_widths: [96, 128, 160, 256]
+  backbone_depths: [2, 2, 6, 2]
+  backbone_dilate_last: false
+  backbone_drop_path: 0.1
+  backbone_weights: ""
+  # The embedding run; init_weights loads every weight but no optimiser or
+  # schedule state.
+  init_weights: "outputs/detector_embed/checkpoints/last.ckpt"
+  # The new head's correction starts at zero, so its first gradients reach
+  # nothing upstream; the warmup covers the rest.
+  backbone_freeze_epochs: 0
+
+head:
+  out_stride: 8
+  head_width: 128
+  head_depth: 2
+  use_pan: true
+  predict_ends: true
+  predict_keypoints: true
+  num_keypoints: 40
+  kp_head_width: 64
+  kp_head_depth: 2
+  embed_dim: 8
+  instance_head: true
+  token_dim: 64
+  instance_dim: 64
+  instance_heads: 4
+  instance_layers: 2
+  instance_tokens: 256
+  instance_slots: 4
+  membership_sigma: 0.5
+  membership_centre_px: 40.0
+  seed_radius_px: 6.0
+
+loss:
+  focal_alpha: 2.0
+  focal_gamma: 4.0
+  fg_weight: 1.0
+  centre_weight: 5.0
+  dir_weight: 0.75
+  size_weight: 0.4
+  tip_weight: 5.0
+  flight_weight: 2.5
+  kp_weight: 1.0
+  kp_offset_weight: 1.0
+  kp_sigma: 2.0
+  # Sized to the converged model: its other terms sum to ~0.1, while a fresh
+  # embedding's pull + push start near 2-4. At weight 1 the embedding set the
+  # direction of every shared layer's update and isolated darts' landing
+  # error tripled within three epochs.
+  embed_weight: 0.05
+  embed_pull_margin: 0.5
+  embed_push_margin: 1.5
+  embed_reg_weight: 0.001
+  embed_min_purity: 0.7
+  # The embedding is already trained; no ramp.
+  embed_warmup_epochs: 0
+  # Huber in pixels on each dart's landing point; ~3px of error costs about
+  # what the converged dense tip term does.
+  instance_weight: 0.01
+  instance_flight_weight: 0.005
+  instance_huber_px: 2.0
+  instance_seed_subset: [0.3, 0.7]
+
+readout:
+  vote_bin_px: 4.0
+  fg_threshold: 0.5
+  peak_min_votes: 8
+  # Only for the Hough readouts logged alongside; with instance_head the
+  # checkpoints rank on the per-dart readout.
+  claim_by_embedding: false
+  # Validation matches detections to darts one-to-one within this distance
+  # (landing point, pixels at the input size).
+  match_gate_px: 40.0
+
+training:
+  # A twenty-fifth of the from-scratch peak: the weights are converged, and
+  # fresh Adam moments move every weight by about the learning rate per step
+  # whatever its gradient. 1e-4 cost isolated darts ~1.4px within one epoch.
+  lr: 2.0e-5
+  backbone_lr_factor: 0.1
+  weight_decay: 0.05
+  warmup_epochs: 3
+  final_lr_factor: 0.01
+  warmup_beta1: 0.8
+  # Cosine over max_epochs; it cannot be lengthened by resuming.
+  max_epochs: 100
+  gradient_clip_val: 0.5
+  batch_size: 16
+  accumulate_grad_batches: 4
+  precision: "bf16-mixed"
+  num_workers: 4
+  accelerator: "gpu"
+  devices: 1
+
+data:
+  image_size: 1024
+  # Real photographs behind the board: scripts/download_places365.py.
+  bg_image_dir: "bg_images"
+  # CUDA devices to render on. Empty renders on the training GPU; e.g. [1]
+  # moves rendering to a second GPU.
+  render_gpus: []
+  epoch_length: 10000
+  val_epoch_length: 1000
+  # P(0, 1, 2, 3 darts)
+  dart_count_weights: [0.05, 0.25, 0.30, 0.40]
+  grouping_prob: 0.55
+  tight_prob: 0.55
+  augmentation:
+    brightness_limit: 0.4
+    contrast_limit: 0.4
+    # albumentations HueSaturationValue on uint8, OpenCV units: hue in
+    # half-degrees (30 = +-60 degrees), saturation and value on 0-255.
+    hue_shift_limit: 30
+    sat_shift_limit: 30
+    val_shift_limit: 20
+    gaussian_blur: true
+    random_erasing: false
+    # Shot, Gaussian and ISO sensor noise, applied on the GPU by GPUAugment.
+    sensor_noise: true
+    shot_noise_p: 0.2
+    gauss_noise_p: 0.8
+    iso_noise_p: 0.6
+
+experiment:
+  name: "detector_per_dart"
+  output_dir: "outputs"
+  seed: 42
+  log_every_n_steps: 50
+  # Mean landing error over every ground-truth dart, a missed dart counting
+  # as match_gate_px; logged every validation epoch. Measured on the
+  # per-dart readout.
+  checkpoint_monitor: "val/landing_px_error_penalised"

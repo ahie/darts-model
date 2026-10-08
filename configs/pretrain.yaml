@@ -1,0 +1,88 @@
+# Stage 1 of 2: pretrain the backbone on dense per-pixel targets from the
+# renderer (part class, offsets to the dart's tip, board UV, height).
+#
+#   darts-pretrain --config configs/pretrain.yaml
+#   darts-promote-backbone outputs/pretrain outputs/backbone.ckpt
+#
+# The heads are scaffolding and are discarded; the backbone is what stage 2
+# (configs/detector.yaml) starts from. Pretraining is the dominant lever: the
+# same detector reached 8.85px validation tip error from pretrained weights
+# against 22.06px from random init, which had already flattened.
+#
+# 300 epochs at ~2.1 min each on one RTX 5090: about 11 hours.
+
+backbone:
+  # Strides 4/8/16/32. Wide at stride 4 because that is where the tip evidence
+  # lives. 3.47M params.
+  widths: [96, 128, 160, 256]
+  depths: [2, 2, 6, 2]
+  dilate_last: false
+  drop_path: 0.1
+
+head:
+  trunk_width: 64
+  trunk_blocks: 2
+  # Tip 57%, barrel 29%, flight 14% of the offset objective. A plain mean over
+  # dart pixels would give the tip 0.3%, because flights outnumber tip cells
+  # 26:1 and carry 12x longer offsets. Flights keep a share because an
+  # occluded tip has no near pixels, and long-range votes are then all that
+  # can localise it.
+  offset_part_weights: [2.0, 1.0, 0.5]
+  w_offset: 2.0
+  w_class: 1.0
+  w_tversky: 1.0
+  w_height: 0.5
+  w_uv: 0.5
+
+data:
+  image_size: 1024
+  # Real photographs behind the board: scripts/download_places365.py.
+  bg_image_dir: "bg_images"
+  # CUDA devices to render on. Empty renders on the training GPU; e.g. [1]
+  # moves rendering to a second GPU.
+  render_gpus: []
+  skill_placement: true
+  # P(0, 1, 2, 3 darts). Zero-dart frames still supervise the board terms.
+  dart_count_weights: [0.05, 0.25, 0.30, 0.40]
+  epoch_length: 4000
+  val_epoch_length: 400
+
+# Photometric only, and matched to the detector's augmentation so the backbone
+# meets the same input distribution in both stages. Sensor noise and
+# normalisation run on the GPU (GPUAugment), as they do for the detector.
+augmentation:
+  brightness_limit: 0.4
+  contrast_limit: 0.4
+  # albumentations HueSaturationValue on uint8, OpenCV units: hue in
+  # half-degrees (30 = +-60 degrees), saturation and value on 0-255.
+  hue_shift_limit: 30
+  sat_shift_limit: 30
+  val_shift_limit: 20
+  gaussian_blur: true
+  random_erasing: false
+  # Shot, Gaussian and ISO sensor noise, applied on the GPU by GPUAugment.
+  sensor_noise: true
+  shot_noise_p: 0.2
+  gauss_noise_p: 0.8
+  iso_noise_p: 0.6
+
+training:
+  # Cosine to min_lr over max_epochs. The schedule cannot be lengthened by
+  # resuming, so set this long from the start.
+  max_epochs: 300
+  batch_size: 4
+  accumulate_grad_batches: 8
+  num_workers: 4
+  precision: "bf16-mixed"
+  lr: 3.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  gradient_clip_val: 1.0
+  accelerator: "gpu"
+  devices: 1
+
+experiment:
+  name: "pretrain"
+  output_dir: "outputs"
+  seed: 42
+  log_every_n_steps: 50

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+.cache/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Build
+build/
+build_*/
+
+# Training data and outputs
+bg_images/
+/data/
+/preview/
+*.tar
+*.tar.partial
+outputs/
+*.ckpt
+
+# Exported models
+*.mlpackage/
+*.tflite
+*.outputs.json
+
+.DS_Store
+*.swp
