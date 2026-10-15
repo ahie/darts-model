@@ -144,3 +144,109 @@ def test_wrapper_requires_both_heads(missing: str) -> None:
     net = DenseDartNet(_tiny(**{missing: False}))
     with pytest.raises(ExportError, match=missing):
         ExportWrapper(net)
+
+
+# --- the argmax-free keypoint spelling -------------------------------------
+#
+# A WebGPU delegate takes neither `ARG_MAX` (it emits int64) nor the
+# `GATHER_ND` the offset lookup lowers to, so the direct spelling strands the
+# keypoint branch on the CPU -- and `kp_logits` is three quarters of everything
+# the model produces. `float_keypoints=True` selects by one-hot mask instead.
+# These hold it to the spelling it replaces.
+
+
+def _both(size: int = SIZE):
+    cfg = _tiny()
+    net = _perturbed(cfg)
+    topk = effective_topk(size, cfg.out_stride)
+    direct = ExportWrapper(net, topk=topk).eval()
+    masked = ExportWrapper(net, topk=topk, float_keypoints=True).eval()
+    torch.manual_seed(1)
+    image = torch.randint(0, 256, (1, 3, size, size)).float()
+    with torch.no_grad():
+        a = dict(zip(OUTPUTS, direct(image)))
+        b = dict(zip(OUTPUTS, masked(image)))
+    return a, b
+
+
+def test_float_keypoints_match_the_argmax_spelling() -> None:
+    a, b = _both()
+    # Sub-pixel: these are normalised coordinates, so 1e-6 of a side is a
+    # thousandth of a pixel at 1024.
+    assert torch.allclose(a["kp_xy"], b["kp_xy"], atol=1e-6), \
+        (a["kp_xy"] - b["kp_xy"]).abs().max()
+    assert torch.allclose(a["kp_conf"], b["kp_conf"], atol=1e-6)
+
+
+def test_float_keypoints_leave_the_dart_outputs_alone() -> None:
+    a, b = _both()
+    for name in OUTPUTS:
+        if name.startswith("kp_"):
+            continue
+        assert torch.equal(a[name], b[name]), name
+
+
+def test_float_keypoints_average_a_tie_rather_than_summing_it() -> None:
+    """Two cells at exactly the maximum must not place a keypoint at the sum.
+
+    An argmax takes the first; the mask sees both. Dividing by the hit count is
+    what makes that an average instead of a position off the end of the image.
+    """
+    cfg = _tiny()
+    net = _perturbed(cfg)
+    wrapper = ExportWrapper(net, topk=effective_topk(SIZE, cfg.out_stride),
+                            float_keypoints=True).eval()
+    torch.manual_seed(1)
+    image = torch.randint(0, 256, (1, 3, SIZE, SIZE)).float()
+
+    with torch.no_grad():
+        dense = net((image - wrapper.norm_mean) / wrapper.norm_std)
+        h, w = dense["fg_logits"].shape[-2:]
+        # Two exact peaks for keypoint 0, at known cells in the same row.
+        kpl = dense["kp_logits"].clone()
+        kpl[0, 0] = -10.0
+        kpl[0, 0, 3, 5] = 7.5
+        kpl[0, 0, 3, 9] = 7.5
+        patched = {**dense, "kp_logits": kpl}
+        # Zero the offsets so the expected answer is the cell centres alone.
+        patched["kp_offset"] = torch.zeros_like(dense["kp_offset"])
+        kp_xy, kp_conf = wrapper._keypoints_float(patched, h * w, h, w)
+
+    # Midway between columns 5 and 9 is 7, and the row is unchanged.
+    assert kp_xy[0, 0, 0].item() == pytest.approx((7 + 0.5) / w, abs=1e-6)
+    assert kp_xy[0, 0, 1].item() == pytest.approx((3 + 0.5) / h, abs=1e-6)
+    assert kp_conf[0, 0].item() == pytest.approx(torch.sigmoid(
+        torch.tensor(7.5)).item(), abs=1e-6)
+
+
+def test_float_keypoints_use_no_integer_tensors() -> None:
+    """The whole point: nothing in the branch may produce an integer type.
+
+    An int64 anywhere is an operation the delegate refuses, and the refusal
+    lands inside the branch rather than at its edge.
+    """
+    cfg = _tiny()
+    net = _perturbed(cfg)
+    wrapper = ExportWrapper(net, topk=effective_topk(SIZE, cfg.out_stride),
+                            float_keypoints=True).eval()
+    torch.manual_seed(1)
+    image = torch.randint(0, 256, (1, 3, SIZE, SIZE)).float()
+    seen: list[torch.dtype] = []
+    original = torch.Tensor.sum
+
+    with torch.no_grad():
+        dense = net((image - wrapper.norm_mean) / wrapper.norm_std)
+        h, w = dense["fg_logits"].shape[-2:]
+
+        def spy(self, *args, **kwargs):
+            seen.append(self.dtype)
+            return original(self, *args, **kwargs)
+
+        torch.Tensor.sum = spy
+        try:
+            wrapper._keypoints_float(dense, h * w, h, w)
+        finally:
+            torch.Tensor.sum = original
+
+    assert seen, "the branch should reduce something"
+    assert all(d.is_floating_point for d in seen), seen

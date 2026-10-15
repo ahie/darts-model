@@ -107,11 +107,15 @@ class ExportWrapper(torch.nn.Module):
     the few hundred cells that survive the gate rather than the whole grid.
     """
 
-    def __init__(self, model: torch.nn.Module, topk: int = TOPK) -> None:
+    def __init__(self, model: torch.nn.Module, topk: int = TOPK,
+                 float_keypoints: bool = False) -> None:
         super().__init__()
         require_export_heads(model.config)
         self.model = model
         self.topk = topk
+        # See `_keypoints_float`. Off by default, so the CoreML export -- which
+        # has no trouble with argmax and is already on devices -- is unchanged.
+        self.float_keypoints = float_keypoints
         from darts_model.data.gpu_augment import IMAGENET_MEAN, IMAGENET_STD
         # Pre-multiplied by 255 so the graph takes 0-255 directly and the
         # divide disappears into the same elementwise op.
@@ -119,6 +123,74 @@ class ExportWrapper(torch.nn.Module):
             "norm_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1) * 255.0)
         self.register_buffer(
             "norm_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1) * 255.0)
+
+    def _keypoints_argmax(self, out, n: int, h: int, w: int):
+        """The direct spelling: argmax, then gather the offset at that cell."""
+        kpl = out["kp_logits"]                      # (1, nk, h, w)
+        nk = int(kpl.shape[1])
+        kv, ki = kpl.reshape(1, nk, n).max(dim=2)   # (1, nk)
+        ko = torch.gather(out["kp_offset"].reshape(1, 2, n), 2,
+                          ki.unsqueeze(1).expand(1, 2, nk))
+        kx = ((ki % w).to(kv.dtype) + 0.5 + ko[:, 0]) / w
+        ky = (torch.div(ki, w, rounding_mode="floor").to(kv.dtype)
+              + 0.5 + ko[:, 1]) / h
+        return torch.stack((kx, ky), dim=2), torch.sigmoid(kv)
+
+    def _keypoints_float(self, out, n: int, h: int, w: int):
+        """The same selection, without an argmax, an index or a gather.
+
+        Why it exists: a WebGPU delegate will not take `ARG_MAX`, because the
+        operation EMITS int64 and the delegate has no int64 -- casting
+        afterwards does not help, the output type is the problem. Nor will it
+        take the `GATHER_ND` the offset lookup lowers to. So the direct
+        spelling strands the keypoint branch on the CPU, and `kp_logits` is
+        655,360 of the 868,352 floats the model produces: three quarters of
+        everything, crossing to the CPU every frame to be scanned there. On a
+        desktop that costs a few milliseconds. On a four-core phone running the
+        CPU side in wasm it is the dominant cost of the frame.
+
+        What replaces it: a peak is where a value EQUALS the maximum, and a
+        mask of that is one-hot over the spatial axis. Multiplying by the mask
+        and summing therefore selects -- the same value a gather would have
+        fetched, by arithmetic the delegate accepts. The index comes out the
+        same way, as a float, by summing the mask against a ramp.
+
+        Ties are handled rather than ignored: two cells at exactly the same
+        maximum would both survive the mask, so every selection is divided by
+        the number of hits. That averages them, where an argmax would take the
+        first. On a trained heatmap an exact float tie at the peak essentially
+        does not happen; dividing costs one operation and removes the
+        possibility of a keypoint landing at the sum of two positions.
+
+        Everything here is float32 and elementwise or a reduction, so nothing
+        in it needs a type the delegate lacks.
+        """
+        kpl = out["kp_logits"].reshape(1, -1, n)    # (1, nk, n)
+        nk = int(kpl.shape[1])
+        peak = kpl.amax(dim=2, keepdim=True)        # (1, nk, 1)
+        # Bool -> float, not int: a cast to an integer type is the thing being
+        # avoided.
+        hit = (kpl == peak).to(kpl.dtype)           # (1, nk, n), one-hot-ish
+        hits = hit.sum(dim=2)                       # (1, nk), 1 unless tied
+
+        ramp = torch.arange(n, dtype=kpl.dtype, device=kpl.device).reshape(1, 1, n)
+        index = (hit * ramp).sum(dim=2) / hits      # (1, nk), the cell, as a float
+
+        # The offset planes are shared by every keypoint, so they broadcast
+        # against the mask.
+        offset = out["kp_offset"].reshape(1, 2, n)
+        ox = (hit * offset[:, 0:1]).sum(dim=2) / hits
+        oy = (hit * offset[:, 1:2]).sum(dim=2) / hits
+
+        # Row and column without a modulo or an integer divide: both are float
+        # operations here, and `index - iy * w` is exactly `index % w` for the
+        # non-negative integers this holds.
+        iy = torch.floor(index / w)
+        ix = index - iy * w
+
+        kx = (ix + 0.5 + ox) / w
+        ky = (iy + 0.5 + oy) / h
+        return torch.stack((kx, ky), dim=2), torch.sigmoid(peak.squeeze(2))
 
     def forward(self, image: torch.Tensor):
         out = self.model((image - self.norm_mean) / self.norm_std)
@@ -160,16 +232,9 @@ class ExportWrapper(torch.nn.Module):
         dart_flight = (gather2("flight_offset") + cell).transpose(1, 2)
 
         # --- keypoints: 655,360 floats -> 120
-        kpl = out["kp_logits"]                      # (1, nk, h, w)
-        nk = int(kpl.shape[1])
-        kv, ki = kpl.reshape(1, nk, n).max(dim=2)   # (1, nk)
-        ko = torch.gather(out["kp_offset"].reshape(1, 2, n), 2,
-                          ki.unsqueeze(1).expand(1, 2, nk))
-        kx = ((ki % w).to(kv.dtype) + 0.5 + ko[:, 0]) / w
-        ky = (torch.div(ki, w, rounding_mode="floor").to(kv.dtype)
-              + 0.5 + ko[:, 1]) / h
-        kp_xy = torch.stack((kx, ky), dim=2)        # (1, nk, 2)
-        kp_conf = torch.sigmoid(kv)
+        kp_xy, kp_conf = (self._keypoints_float(out, n, h, w)
+                          if self.float_keypoints
+                          else self._keypoints_argmax(out, n, h, w))
 
         outs = (dart_score, dart_centre, dart_direction, dart_extent,
                 dart_tip, dart_flight, kp_xy, kp_conf)
