@@ -344,6 +344,27 @@ class DenseDartConfig:
     readout_flight_weight: float = 0.05
     readout_dart_attn_weight: float = 0.5
     readout_tip_attn_weight: float = 0.5
+
+    # query heatmap readout (model/query_heatmap.py)
+    #: One heatmap per learned query over the stride-4 tip grid, built from
+    #: the tip head's features, with a confidence each; Hungarian-matched and
+    #: trained by KL to each dart's Gaussian. Requires predict_tip_heatmap at
+    #: a stride finer than the detector's; shares query_count,
+    #: query_conf_threshold and the matching costs with the query readout.
+    heatmap_readout: bool = False
+    heatmap_dim: int = 128
+    heatmap_heads: int = 4
+    heatmap_layers: int = 3
+    #: Channels of the per-cell embedding the queries are dotted with.
+    heatmap_pixel_dim: int = 64
+    #: Half-width, in tip cells, of the window the landing point is
+    #: soft-argmaxed over: 2 is 5x5, +-10px at stride 4.
+    heatmap_window: int = 2
+    heatmap_conf_weight: float = 1.0
+    heatmap_kl_weight: float = 1.0
+    heatmap_l1_weight: float = 0.1
+    #: Weight of the heatmap cross-entropy in the matching cost.
+    heatmap_cost_ce: float = 1.0
     #: Train only the readout: every other weight is frozen and the dense
     #: model runs without gradients. Every fine-tune of the converged dense
     #: model so far disturbed it while it restarted; frozen, it cannot move,
@@ -440,8 +461,19 @@ class DenseDartConfig:
                                        and self.predict_ends):
             raise ValueError("token_readout requires predict_tip_heatmap and "
                              "predict_ends")
+        if self.heatmap_readout and (self.token_readout or self.query_head
+                                     or self.instance_head):
+            raise ValueError("heatmap_readout, token_readout, query_head and "
+                             "instance_head are alternative readouts; set one")
+        if self.heatmap_readout and not (
+                self.predict_tip_heatmap and self.predict_ends
+                and self.tip_stride < self.out_stride):
+            raise ValueError("heatmap_readout requires predict_tip_heatmap at "
+                             "a tip_stride finer than out_stride, and "
+                             "predict_ends")
         if self.freeze_dense and not (self.token_readout or self.query_head
-                                      or self.instance_head):
+                                      or self.instance_head
+                                      or self.heatmap_readout):
             raise ValueError("freeze_dense trains a readout only; enable one")
         if self.freeze_dense and self.backbone_freeze_epochs:
             raise ValueError("freeze_dense freezes the backbone for the whole "
@@ -641,6 +673,10 @@ class DenseDartNet(nn.Module):
         if cfg.token_readout:
             from darts_model.model.token_readout import TokenReadout
             self.token_readout = TokenReadout(cfg)
+        self.heatmap_readout = None
+        if cfg.heatmap_readout:
+            from darts_model.model.query_heatmap import HeatmapReadout
+            self.heatmap_readout = HeatmapReadout(cfg)
         self.fine_proj = None
         if cfg.instance_head or cfg.query_head:
             c_in = cfg.head_width * (2 if cfg.token_inputs == "neck+trunk" else 1)
@@ -706,6 +742,9 @@ class DenseDartNet(nn.Module):
             x = self.smooth[i](x)
             top_down[i] = x
 
+        # The coarsest level the neck builds: the deepest stage, plus, with
+        # the PAN, what the bottom-up path carried up from the finer levels.
+        coarse = top_down[-1]
         if self.down is not None:
             # Bottom-up: walk back up fusing with the top-down map at each
             # level, then walk down once more so the finest level -- the one
@@ -716,6 +755,7 @@ class DenseDartNet(nn.Module):
                 up = sm(dn(up) + top_down[i + 1])
                 bottom_up.append(up)
             x = bottom_up[-1]
+            coarse = x
             for i in range(len(bottom_up) - 2, -1, -1):
                 x = bottom_up[i] + F.interpolate(
                     x, size=bottom_up[i].shape[-2:], mode="bilinear",
@@ -728,9 +768,14 @@ class DenseDartNet(nn.Module):
         if self.ends_head is not None:
             e = _fp32(self.ends_head, x)
             out_ends = {"tip_offset": e[:, 0:2], "flight_offset": e[:, 2:4]}
-        if self.token_readout is not None:
-            # The stage-3 tokens read the neck at their stride-8 parent cell.
+        if self.token_readout is not None or self.heatmap_readout is not None:
+            # The stage-3 tokens read the neck at their stride-8 parent cell;
+            # the heatmap queries' heatmaps read it.
             out_ends["neck"] = neck
+        if self.heatmap_readout is not None:
+            # The heatmap queries attend to the coarsest level: which dart a
+            # query takes is the most global decision the readout makes.
+            out_ends["neck_coarse"] = coarse
         if self.embed_head is not None:
             out_ends["embedding"] = _fp32(self.embed_head, x)   # (B, E, h, w)
         if self.token_proj is not None:
@@ -818,6 +863,8 @@ class DenseDartNet(nn.Module):
         if self.token_readout is not None:
             from darts_model.model.token_readout import gather_tokens
             return self.token_readout(gather_tokens(out, cfg.readout_tokens))
+        if self.heatmap_readout is not None:
+            return self.heatmap_readout(out)
         cand = gather_candidates(out, candidate_count(cfg.out_stride),
                                  centre_scale, cfg.context_radius)
         if self.query_head is not None:
@@ -897,7 +944,8 @@ def _dist(a: torch.Tensor, dim: int) -> torch.Tensor:
 def slot_floor(cfg) -> float:
     """The score a per-dart slot must clear to be a dart: a query's
     confidence threshold, or a seed's Hough vote floor."""
-    if cfg.query_head or getattr(cfg, "token_readout", False):
+    if (cfg.query_head or getattr(cfg, "token_readout", False)
+            or getattr(cfg, "heatmap_readout", False)):
         return float(cfg.query_conf_threshold)
     return float(cfg.peak_min_votes * cfg.fg_threshold)
 
@@ -910,7 +958,8 @@ def token_feature_dim(cfg) -> int:
 
 def slot_count(cfg) -> int:
     """Per-dart slots the model reads out; 0 without a per-dart readout."""
-    if cfg.query_head or getattr(cfg, "token_readout", False):
+    if (cfg.query_head or getattr(cfg, "token_readout", False)
+            or getattr(cfg, "heatmap_readout", False)):
         return int(cfg.query_count)
     if cfg.instance_head:
         return int(cfg.instance_slots)
@@ -1338,6 +1387,18 @@ class DenseDartLitModule(L.LightningModule):
             if stage == "val":
                 self._gt_seed_err.append(tip_px.cpu())
 
+        if cfg.heatmap_readout and "dart_ends" in batch:
+            from darts_model.model.query_heatmap import heatmap_losses
+            pred = self.model.heatmap_readout(out)
+            hl, tip_px, _ = heatmap_losses(pred, batch, cfg,
+                                           float(batch["image"].shape[-1]))
+            losses.update(hl)
+            total = (total + cfg.heatmap_conf_weight * hl["h_conf"]
+                     + cfg.heatmap_kl_weight * hl["h_kl"]
+                     + cfg.heatmap_l1_weight * hl["h_l1"])
+            if stage == "val":
+                self._gt_seed_err.append(tip_px.cpu())
+
         if cfg.instance_head and "dart_ends" in batch:
             # Slot s is ground-truth dart s; its seed is the mean embedding of
             # a random part of the dart in training, of all of it in
@@ -1517,11 +1578,16 @@ class DenseDartLitModule(L.LightningModule):
             readouts["queries"] = self._per_dart_detections(out)
         if cfg.token_readout:
             readouts["tokens"] = self._per_dart_detections(out)
+        if cfg.heatmap_readout:
+            readouts["heatmaps"] = self._per_dart_detections(out)
+            readouts["heatmaps_offset"] = self._per_dart_detections(
+                out, key="tip_hard")
         modes = [cfg.claim_by_embedding, not cfg.claim_by_embedding]
         for by_embedding in modes[:2 if "embedding" in out else 1]:
             name = "embedding_claim" if by_embedding else "centre_claim"
             readouts[name] = hough(by_embedding)
-        if cfg.predict_tip_heatmap and cfg.token_readout:
+        if cfg.predict_tip_heatmap and (cfg.token_readout
+                                        or cfg.heatmap_readout):
             # Stage 2's readout on the same frozen weights: Hough with the tip
             # peaks assigned, alongside plain Hough.
             readouts["centre_claim_assigned"] = self._snapped(
@@ -1990,17 +2056,19 @@ class DenseDartLitModule(L.LightningModule):
     #: The per-dart readout's own weights: their own optimizer group, at
     #: ``readout_lr_factor``.
     READOUT_PREFIXES = ("token_proj.", "fine_proj.", "instance_head.",
-                        "query_head.", "tip_", "token_readout.")
+                        "query_head.", "tip_", "token_readout.",
+                        "heatmap_readout.")
 
     #: What trains under ``freeze_dense``: the readouts' own weights. The tip
     #: head is stage 2's and stays frozen with the rest.
     TRAINED_WHEN_FROZEN = ("token_proj.", "fine_proj.", "instance_head.",
-                           "query_head.", "token_readout.")
+                           "query_head.", "token_readout.",
+                           "heatmap_readout.")
 
     #: Heads that may be absent from an ``init_weights`` checkpoint.
     NEW_HEAD_PREFIXES = ("embed_head.", "token_proj.", "fine_proj.",
                          "instance_head.", "query_head.", "tip_",
-                         "token_readout.")
+                         "token_readout.", "heatmap_readout.")
 
     def _load_full(self, path: str) -> None:
         """Every model weight from a previous run; no optimizer state.

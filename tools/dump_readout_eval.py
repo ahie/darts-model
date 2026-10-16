@@ -9,7 +9,9 @@ peaks to detections can then be fitted and compared without a GPU or a
 renderer. With a stage-3 token readout, also each query's confidence and its
 landing point three ways: the soft blend it was trained with, the hard
 reading of its single highest-weighted option, and the blend over tokens
-alone, without the estimate's share.
+alone, without the estimate's share. With the query heatmap readout, each
+query's confidence and both its decodes: ``soft``, the window soft-argmax,
+and ``hard``, the argmax cell plus the tip head's offset.
 
 The renderer is deterministic in its seed, so the same ``--seed`` and
 ``--frames`` reproduce the same frames for any checkpoint.
@@ -115,6 +117,12 @@ def main() -> None:
             slots = {"score": r["score"], "soft": r["tip"], "hard": hard,
                      "tokens_only": tokens_only, "estimate": r["tip_estimate"],
                      "picked_estimate": pick == 0, "top_weight": w.amax(-1)}
+        if getattr(lit.model, "heatmap_readout", None) is not None:
+            with torch.no_grad():
+                r = lit.model.heatmap_readout(out)
+            # "soft" is the window soft-argmax, "hard" the argmax cell plus
+            # the tip head's offset.
+            slots = {"score": r["score"], "soft": r["tip"], "hard": r["tip_hard"]}
         for b, (s, vis) in enumerate(pending):
             dets = detect({k: v[b] for k, v in dec.items()}, fg[b], cfg)
             mask = s["dart_mask"]
