@@ -355,8 +355,11 @@ class DenseDartConfig:
     heatmap_dim: int = 128
     heatmap_heads: int = 4
     heatmap_layers: int = 3
-    #: Channels of the per-cell embedding the queries are dotted with.
+    #: Channels of the per-cell embedding: the tip head's features, the neck
+    #: and the cell's position.
     heatmap_pixel_dim: int = 64
+    #: Hidden units of the MLP each (query, cell) pair goes through.
+    heatmap_hidden: int = 64
     #: Half-width, in tip cells, of the window the landing point is
     #: soft-argmaxed over: 2 is 5x5, +-10px at stride 4.
     heatmap_window: int = 2

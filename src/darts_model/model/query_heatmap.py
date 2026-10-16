@@ -12,12 +12,18 @@ features:
   global decision the readout makes, and the heatmaps carry the detail. The
   cross attention is what makes them depend on the frame: learned queries
   that only attended to each other would be the same for every image.
-* Heatmaps: query i's logit at a cell is its embedding's dot product with a
-  per-cell embedding of the tip head's features and the neck, and nothing
-  else. The tip head's output logits are deliberately not added: they are the
-  same for every query and far sharper than a query's own term, so every
-  query's softmax would collapse onto the same strongest tip, and separating
-  the darts is the queries' whole job.
+* Heatmaps: a small MLP over every (query, cell) pair answers "is this cell
+  the tip of *my* dart". Each cell has an embedding of the tip head's
+  features, the neck and a Fourier encoding of its own position; the query
+  shifts the MLP's hidden layer and supplies its output weights. The tip
+  head's features say where *a* tip is but look alike at every dart's tip, and
+  convolutional features carry no absolute position, so a plain dot product
+  between a query and such cells cannot single one tip out; the position lets
+  a query that has located its dart target that place, and the nonlinearity
+  lets query and cell interact. The tip head's output logits are deliberately
+  not added: they are the same for every query and far sharper than a
+  query's own term, so every query's softmax would collapse onto the same
+  strongest tip.
 * Decoding: the argmax cell, refined two ways. ``tip`` is a soft-argmax over a
   small window around it, the sub-cell position read off the query's own
   distribution; restricted to the window, a far tail cannot bias it and two
@@ -106,8 +112,14 @@ class HeatmapReadout(nn.Module):
         self.norm = nn.LayerNorm(d)
         self.pixel_tip = nn.Conv2d(cfg.tip_head_width, p, 1)
         self.pixel_neck = nn.Conv2d(cfg.head_width, p, 1)
+        self.pixel_pos = nn.Linear(2 * 2 * POSITION_OCTAVES, p)
         self.pixel_out = nn.Conv2d(p, p, 1)
-        self.embed = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, p))
+        # The (query, cell) MLP: the cell's hidden units, shifted by the
+        # query's, then the query's own output weights.
+        hidden = cfg.heatmap_hidden
+        self.cell_hidden = nn.Conv1d(p, hidden, 1)
+        self.query_hidden = nn.Linear(d, hidden)
+        self.query_out = nn.Linear(d, hidden + 1)
         # One confidence branch per query.
         self.conf = nn.ModuleList(nn.Linear(d, 1) for _ in range(n))
 
@@ -151,12 +163,21 @@ class HeatmapReadout(nn.Module):
             q = ca(q, mem, none_m)
         q = self.norm(q)
 
-        pixel = self.pixel_tip(feat) + F.interpolate(
-            self.pixel_neck(neck), size=(h, w), mode="bilinear",
-            align_corners=False)
+        cell_y = (torch.arange(h, device=feat.device, dtype=feat.dtype) + 0.5) / h
+        cell_x = (torch.arange(w, device=feat.device, dtype=feat.dtype) + 0.5) / w
+        cells = torch.stack(torch.meshgrid(cell_x, cell_y, indexing="xy"), -1)
+        pos = self.pixel_pos(_fourier(cells, POSITION_OCTAVES))   # (h, w, P)
+        pixel = (self.pixel_tip(feat) + pos.permute(2, 0, 1).unsqueeze(0)
+                 + F.interpolate(self.pixel_neck(neck), size=(h, w),
+                                 mode="bilinear", align_corners=False))
         pixel = self.pixel_out(F.gelu(pixel)).flatten(2)          # (B, P, h*w)
-        p = int(pixel.shape[1])
-        heat = self.embed(q) @ pixel / math.sqrt(p)              # (B, Q, h*w)
+
+        hidden = F.gelu(self.cell_hidden(pixel).unsqueeze(1)
+                        + self.query_hidden(q).unsqueeze(-1))     # (B, Q, H, h*w)
+        wout = self.query_out(q)                                  # (B, Q, H + 1)
+        nh = int(hidden.shape[2])
+        heat = (torch.einsum("bqh,bqhk->bqk", wout[..., :nh], hidden)
+                / math.sqrt(nh) + wout[..., nh:])                 # (B, Q, h*w)
 
         index = heat.argmax(-1)                                   # (B, Q)
         cy = torch.div(index, w, rounding_mode="floor")

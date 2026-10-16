@@ -66,14 +66,17 @@ loss:
   tip_offset_radius: 1
   tip_offset_weighting: "gaussian"
   # The readout: three plain learned queries attending to each other and to
-  # the neck's stride-32 level; each query's heatmap is its dot product with
-  # a per-cell embedding of the tip head's features and the neck. The landing
-  # point is a soft-argmax over the 5x5 cells around the argmax.
+  # the neck's stride-32 level; each query's heatmap is a small MLP over
+  # every (query, cell) pair, the cell embedding carrying the tip head's
+  # features, the neck and the cell's position, the query shifting the hidden
+  # layer and supplying the output weights. The landing point is a
+  # soft-argmax over the 5x5 cells around the argmax.
   heatmap_readout: true
   heatmap_dim: 128
   heatmap_heads: 4
   heatmap_layers: 3
   heatmap_pixel_dim: 64
+  heatmap_hidden: 64
   heatmap_window: 2
   query_count: 3
   tip_heat_weight: 1.0
