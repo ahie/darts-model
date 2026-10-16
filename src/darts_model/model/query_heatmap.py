@@ -4,7 +4,7 @@ grid, a confidence for each, Hungarian-matched to the darts.
 The class-agnostic tip heatmap already finds tips to about a pixel; what it
 cannot say is which peak belongs to which dart, nor where a hidden tip is. So
 each query here draws its own heatmap over the same grid, from the same
-features, and only has to learn *which* tip is its own:
+features:
 
 * Queries: plain learned queries -- no anchors or reference points -- that
   attend to each other and to the neck's coarsest level (stride 32 with the
@@ -13,9 +13,11 @@ features, and only has to learn *which* tip is its own:
   cross attention is what makes them depend on the frame: learned queries
   that only attended to each other would be the same for every image.
 * Heatmaps: query i's logit at a cell is its embedding's dot product with a
-  per-cell embedding of the tip head's features and the neck, plus the class-
-  agnostic tip logit at a learned scale -- the prior of where tips are, which
-  a query may override where it is weak, as it must for a hidden tip.
+  per-cell embedding of the tip head's features and the neck, and nothing
+  else. The tip head's output logits are deliberately not added: they are the
+  same for every query and far sharper than a query's own term, so every
+  query's softmax would collapse onto the same strongest tip, and separating
+  the darts is the queries' whole job.
 * Decoding: the argmax cell, refined two ways. ``tip`` is a soft-argmax over a
   small window around it, the sub-cell position read off the query's own
   distribution; restricted to the window, a far tail cannot bias it and two
@@ -106,7 +108,6 @@ class HeatmapReadout(nn.Module):
         self.pixel_neck = nn.Conv2d(cfg.head_width, p, 1)
         self.pixel_out = nn.Conv2d(p, p, 1)
         self.embed = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, p))
-        self.prior_scale = nn.Parameter(torch.ones(()))
         # One confidence branch per query.
         self.conf = nn.ModuleList(nn.Linear(d, 1) for _ in range(n))
 
@@ -155,8 +156,7 @@ class HeatmapReadout(nn.Module):
             align_corners=False)
         pixel = self.pixel_out(F.gelu(pixel)).flatten(2)          # (B, P, h*w)
         p = int(pixel.shape[1])
-        heat = (self.embed(q) @ pixel / math.sqrt(p)
-                + self.prior_scale * out["tip_logits"].flatten(1).unsqueeze(1))
+        heat = self.embed(q) @ pixel / math.sqrt(p)              # (B, Q, h*w)
 
         index = heat.argmax(-1)                                   # (B, Q)
         cy = torch.div(index, w, rounding_mode="floor")
