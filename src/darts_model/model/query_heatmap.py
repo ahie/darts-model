@@ -9,7 +9,8 @@ features:
 * Queries: plain learned queries -- no anchors or reference points -- that
   attend to each other and to the neck's coarsest level (stride 32 with the
   PAN, 32x32 at 1024) and nothing finer: which dart a query takes is the most
-  global decision the readout makes, and the heatmaps carry the detail. The
+  global decision the readout makes, and the heatmaps carry the detail.
+  ``heatmap_memory: "neck"`` attends to the stride-8 output instead. The
   cross attention is what makes them depend on the frame: learned queries
   that only attended to each other would be the same for every image.
 * Heatmaps: a small MLP over every (query, cell) pair answers "is this cell
@@ -151,7 +152,7 @@ class HeatmapReadout(nn.Module):
         b = int(neck.shape[0])
         h, w = int(feat.shape[-2]), int(feat.shape[-1])
 
-        mem = out["neck_coarse"]
+        mem = out["neck_coarse" if cfg.heatmap_memory == "coarse" else "neck"]
         mh, mw = int(mem.shape[-2]), int(mem.shape[-1])
         ys = (torch.arange(mh, device=mem.device, dtype=mem.dtype) + 0.5) / mh
         xs = (torch.arange(mw, device=mem.device, dtype=mem.dtype) + 0.5) / mw

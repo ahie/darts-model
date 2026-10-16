@@ -164,3 +164,14 @@ def test_the_landing_l1_counts_only_queries_peaking_on_their_tip():
     assert by_dart == {0: True, 1: False}
     # So the L1 is query 0's decode error alone: |0.2| + |0.1| cells, 4px each.
     assert torch.allclose(losses["h_l1"], torch.tensor(1.2), atol=1e-4)
+
+
+def test_the_queries_can_attend_to_the_stride_8_neck():
+    torch.manual_seed(0)
+    lit = DenseDartLitModule(_hcfg(heatmap_memory="neck")).eval()
+    with torch.no_grad():
+        out = lit.model(_batch()["image"].float())
+        r = lit.model.read_darts(out)
+    assert r["tip"].shape == (2, lit.config.query_count, 2)
+    with pytest.raises(ValueError, match="heatmap_memory"):
+        _hcfg(heatmap_memory="fine")

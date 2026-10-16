@@ -355,6 +355,9 @@ class DenseDartConfig:
     heatmap_dim: int = 128
     heatmap_heads: int = 4
     heatmap_layers: int = 3
+    #: What the queries cross-attend to: "coarse", the neck's stride-32
+    #: level (32x32 at 1024), or "neck", its stride-8 output (128x128).
+    heatmap_memory: str = "coarse"
     #: Channels of the per-cell embedding: the tip head's features, the neck
     #: and the cell's position.
     heatmap_pixel_dim: int = 64
@@ -470,6 +473,9 @@ class DenseDartConfig:
                                      or self.instance_head):
             raise ValueError("heatmap_readout, token_readout, query_head and "
                              "instance_head are alternative readouts; set one")
+        if self.heatmap_memory not in ("coarse", "neck"):
+            raise ValueError(f"heatmap_memory must be 'coarse' or 'neck', got "
+                             f"{self.heatmap_memory!r}")
         if self.heatmap_readout and not (
                 self.predict_tip_heatmap and self.predict_ends
                 and self.tip_stride < self.out_stride):
