@@ -14,8 +14,9 @@ features:
   that only attended to each other would be the same for every image.
 * Heatmaps: a small MLP over every (query, cell) pair answers "is this cell
   the tip of *my* dart". Each cell has an embedding of the tip head's
-  features, the neck and a Fourier encoding of its own position; the query
-  shifts the MLP's hidden layer and supplies its output weights. The tip
+  features, the neck and a Fourier encoding of its own position, mixed over
+  its 3x3 neighbourhood so it can express where in the cell a tip lies; the
+  query shifts the MLP's hidden layer and supplies its output weights. The tip
   head's features say where *a* tip is but look alike at every dart's tip, and
   convolutional features carry no absolute position, so a plain dot product
   between a query and such cells cannot single one tip out; the position lets
@@ -113,7 +114,9 @@ class HeatmapReadout(nn.Module):
         self.pixel_tip = nn.Conv2d(cfg.tip_head_width, p, 1)
         self.pixel_neck = nn.Conv2d(cfg.head_width, p, 1)
         self.pixel_pos = nn.Linear(2 * 2 * POSITION_OCTAVES, p)
-        self.pixel_out = nn.Conv2d(p, p, 1)
+        # 3x3: a cell's sub-cell position relative to a tip is read from its
+        # neighbourhood, as the tip head's own offset conv reads it.
+        self.pixel_out = nn.Conv2d(p, p, 3, padding=1)
         # The (query, cell) MLP: the cell's hidden units, shifted by the
         # query's, then the query's own output weights.
         hidden = cfg.heatmap_hidden

@@ -90,7 +90,7 @@ loss:
   heatmap_cost_ce: 1.0
   heatmap_conf_weight: 1.0
   heatmap_kl_weight: 1.0
-  heatmap_l1_weight: 0.1
+  heatmap_l1_weight: 0.5
 
 readout:
   vote_bin_px: 4.0
