@@ -69,8 +69,9 @@ def test_losses_are_finite_on_frames_without_darts():
     batch["dart_mask"][:] = False
     with torch.no_grad():
         out = lit.model(batch["image"].float())
-    losses, err, _ = heatmap_losses(lit.model.heatmap_readout(out), batch,
-                                    lit.config, 256.0)
+    losses, err, _, stats = heatmap_losses(lit.model.heatmap_readout(out),
+                                           batch, lit.config, 256.0)
+    assert stats["on_peak"].numel() == 0
     assert all(torch.isfinite(v) for v in losses.values())
     assert err.numel() == 0
 
@@ -133,5 +134,33 @@ def test_validation_logs_both_decodes_against_stage_two():
                  "val/landing_px_error_penalised_heatmaps_offset",
                  "val/landing_px_error_penalised_centre_claim",
                  "val/landing_px_error_penalised_centre_claim_assigned",
-                 "val/h_kl_loss", "val/h_l1_loss"):
+                 "val/h_kl_loss", "val/h_l1_loss",
+                 "val/heatmap_on_peak_share"):
         assert name in logged, name
+
+
+def test_the_landing_l1_counts_only_queries_peaking_on_their_tip():
+    """A query whose argmax is on another dart's tip has a decode window that
+    cannot reach its own tip; the L1 leaves it to the KL and the matching."""
+    from types import SimpleNamespace
+
+    h = w = 16
+    cfg = SimpleNamespace(tip_sigma=1.0, heatmap_window=3, query_cost_px=0.1,
+                          query_cost_conf=1.0, heatmap_cost_ce=1.0)
+    ends = torch.tensor([[[5.3 / w, 5.6 / h, 0.0, 0.0],
+                          [12.4 / w, 11.2 / h, 0.0, 0.0]]])
+    batch = {"dart_ends": ends, "dart_mask": torch.tensor([[True, True]])}
+    heat = torch.full((1, 2, h * w), -10.0)
+    heat[0, 0, 5 * w + 5] = 5.0      # query 0 peaks on dart 0's tip cell
+    heat[0, 1, 5 * w + 6] = 5.0      # query 1 also peaks next to dart 0
+    tip = torch.tensor([[[5.5 / w, 5.5 / h], [6.5 / w, 5.5 / h]]])
+    pred = {"heat_logits": heat, "grid_size": (h, w),
+            "logit": torch.zeros(1, 2), "score": torch.full((1, 2), 0.5),
+            "tip": tip, "tip_hard": tip,
+            "cell": torch.tensor([[[5, 5], [6, 5]]])}
+    losses, _, (f, q, d), stats = heatmap_losses(pred, batch, cfg, float(w * 4))
+    # Query 1 is matched to dart 1 but peaks a dart away: off its peak.
+    by_dart = {int(dd): bool(o) for dd, o in zip(d, stats["on_peak"])}
+    assert by_dart == {0: True, 1: False}
+    # So the L1 is query 0's decode error alone: |0.2| + |0.1| cells, 4px each.
+    assert torch.allclose(losses["h_l1"], torch.tensor(1.2), atol=1e-4)

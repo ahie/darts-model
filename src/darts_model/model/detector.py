@@ -361,8 +361,10 @@ class DenseDartConfig:
     #: Hidden units of the MLP each (query, cell) pair goes through.
     heatmap_hidden: int = 64
     #: Half-width, in tip cells, of the window the landing point is
-    #: soft-argmaxed over: 2 is 5x5, +-10px at stride 4.
-    heatmap_window: int = 2
+    #: soft-argmaxed over: 3 is 7x7, +-14px at stride 4. At 2 the window
+    #: clips the sigma-1 target enough to bias its own centroid by up to
+    #: 0.18px; at 3 by 0.01px.
+    heatmap_window: int = 3
     heatmap_conf_weight: float = 1.0
     heatmap_kl_weight: float = 1.0
     heatmap_l1_weight: float = 0.1
@@ -1393,14 +1395,17 @@ class DenseDartLitModule(L.LightningModule):
         if cfg.heatmap_readout and "dart_ends" in batch:
             from darts_model.model.query_heatmap import heatmap_losses
             pred = self.model.heatmap_readout(out)
-            hl, tip_px, _ = heatmap_losses(pred, batch, cfg,
-                                           float(batch["image"].shape[-1]))
+            hl, tip_px, _, hs = heatmap_losses(
+                pred, batch, cfg, float(batch["image"].shape[-1]))
             losses.update(hl)
             total = (total + cfg.heatmap_conf_weight * hl["h_conf"]
                      + cfg.heatmap_kl_weight * hl["h_kl"]
                      + cfg.heatmap_l1_weight * hl["h_l1"])
             if stage == "val":
                 self._gt_seed_err.append(tip_px.cpu())
+                self._hm_on_peak.append(hs["on_peak"].cpu())
+                self._hm_soft_px.append(hs["soft_px"][hs["on_peak"]].cpu())
+                self._hm_offset_px.append(hs["offset_px"][hs["on_peak"]].cpu())
 
         if cfg.instance_head and "dart_ends" in batch:
             # Slot s is ground-truth dart s; its seed is the mean embedding of
@@ -1920,6 +1925,12 @@ class DenseDartLitModule(L.LightningModule):
         self._land_err_alt: dict[str, list[torch.Tensor]] = {}
         #: Per-dart readout from ground-truth seeds, per dart.
         self._gt_seed_err: list[torch.Tensor] = []
+        #: Heatmap readout, per matched (query, dart): whether the query's
+        #: argmax is within a cell of the tip, and for those pairs both
+        #: decodes' errors in pixels.
+        self._hm_on_peak: list[torch.Tensor] = []
+        self._hm_soft_px: list[torch.Tensor] = []
+        self._hm_offset_px: list[torch.Tensor] = []
         #: Tip heatmap: darts with a peak near them, and that peak's error.
         self._tip_peak_n = 0
         self._tip_peak_err: list[torch.Tensor] = []
@@ -1994,6 +2005,17 @@ class DenseDartLitModule(L.LightningModule):
             gt_seed = torch.cat(self._gt_seed_err)
             if gt_seed.numel():
                 self.log("val/landing_px_error_gt_seeds", gt_seed.mean())
+        if self._hm_on_peak:
+            # Assignment and precision apart: the share of matched queries
+            # peaking on their own dart's tip, and for those, each decode's
+            # median error, whatever the confidence.
+            on = torch.cat(self._hm_on_peak)
+            if on.numel():
+                self.log("val/heatmap_on_peak_share", on.float().mean())
+            soft, offset = torch.cat(self._hm_soft_px), torch.cat(self._hm_offset_px)
+            if soft.numel():
+                self.log("val/heatmap_soft_px_median", soft.median())
+                self.log("val/heatmap_offset_px_median", offset.median())
         if self._cl_cells:
             # The share of a clustered dart's cells that describe a neighbour:
             # 16.5% before the embedding existed, against 0.5% for isolated

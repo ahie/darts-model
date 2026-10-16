@@ -35,9 +35,10 @@ features:
 * Training (:func:`heatmap_losses`): each dart's target is the tip heatmap's
   Gaussian, centred on the exact landing point and normalised into a
   distribution, without the pin to 1.0 that only the focal loss needs. KL to
-  each query's softmax over the whole grid; an L1 on the window soft-argmax,
-  taken around the tip's own cell, so the window's centre of mass is trained
-  onto the tip; and a confidence BCE. The matching cost is confidence, the
+  each query's softmax over the whole grid; an L1 on the decoded landing
+  point -- the window soft-argmax around the query's own argmax, exactly as
+  read out -- for the queries whose argmax lies within a cell of their
+  dart's tip; and a confidence BCE. The matching cost is confidence, the
   cross-entropy and the decoded landing distance.
 
 Coinciding tips need nothing special: two queries may peak on the same cell.
@@ -215,6 +216,7 @@ class HeatmapReadout(nn.Module):
             "direction": at_parent(dec["direction"]),
             "extent": at_parent(dec["extent"]),
             "heat_logits": heat,
+            "cell": torch.stack((cx, cy), -1),                    # (B, Q, 2)
             "grid_size": (h, w),
         }
 
@@ -250,15 +252,22 @@ def match_heatmaps(pred: dict, ce: torch.Tensor, gt_tip: torch.Tensor,
 
 
 def heatmap_losses(pred: dict, batch: dict, cfg, scale: float):
-    """The readout's losses, the matched landing errors in pixels, and the
-    matching.
+    """The readout's losses, the matched landing errors in pixels, the
+    matching, and per-pair statistics.
 
     ``h_conf``: BCE over every query, 1 when matched. For each matched
     (query, dart): ``h_kl``, the KL from the dart's Gaussian to the query's
-    softmax over the grid; and ``h_l1``, the L1 in pixels of the window
-    soft-argmax around the tip's own cell -- not around the query's argmax,
-    which early in training is anywhere -- so the window's centre of mass is
-    trained onto the tip.
+    softmax over the grid. ``h_l1``: the L1 in pixels of the decoded landing
+    point, for the matched queries whose argmax lies within a cell of their
+    dart's tip (Chebyshev). The decode's window is centred on the argmax, so
+    only a query peaking on its own tip has a window that can reach it; a
+    query peaking elsewhere is left to the KL and the matching, and a window
+    placed around the tip instead would measure the shared features' shape
+    there, not the query's peak.
+
+    The statistics, per matched pair: ``on_peak`` (the argmax is within a
+    cell of the tip) and both decodes' errors in pixels, ``soft_px`` and
+    ``offset_px``.
     """
     h, w = pred["grid_size"]
     ends = batch["dart_ends"].float()
@@ -274,20 +283,25 @@ def heatmap_losses(pred: dict, batch: dict, cfg, scale: float):
     zero = pred["logit"].sum() * 0.0
     if not f.numel():
         losses.update(h_kl=zero, h_l1=zero)
-        return losses, zero.new_zeros(0), (f, q, d)
+        empty = zero.new_zeros(0)
+        stats = {"on_peak": empty.bool(), "soft_px": empty, "offset_px": empty}
+        return losses, empty, (f, q, d), stats
 
     t = target[f, d]
     entropy = -(t * t.clamp(min=1e-12).log()).sum(-1)
     losses["h_kl"] = (ce[f, q, d] - entropy).mean()
 
     gt = ends[f, d, 0:2]
-    cx = (gt[:, 0] * w).floor().long().clamp(0, w - 1)
-    cy = (gt[:, 1] * h).floor().long().clamp(0, h - 1)
-    window = local_softargmax(pred["heat_logits"][f, q].float(), cy, cx,
-                              (h, w), cfg.heatmap_window)            # cells
-    cell_px = scale / w
-    losses["h_l1"] = ((window - gt * torch.tensor([w, h], device=gt.device))
-                      .abs().sum(-1) * cell_px).mean()
+    size = torch.tensor([w, h], device=gt.device)
+    tip_cell = (gt * size).floor().long()
+    on_peak = ((pred["cell"][f, q] - tip_cell).abs() <= 1).all(-1)
+    l1 = (pred["tip"][f, q] - gt).abs().sum(-1) * scale
+    losses["h_l1"] = l1[on_peak].mean() if bool(on_peak.any()) else zero
 
-    tip_px = ((pred["tip"][f, q] - gt).square().sum(-1) + 1e-12).sqrt() * scale
-    return losses, tip_px.detach(), (f, q, d)
+    def px(a):
+        return ((a - gt).square().sum(-1) + 1e-12).sqrt() * scale
+
+    tip_px = px(pred["tip"][f, q])
+    stats = {"on_peak": on_peak.detach(), "soft_px": tip_px.detach(),
+             "offset_px": px(pred["tip_hard"][f, q]).detach()}
+    return losses, tip_px.detach(), (f, q, d), stats

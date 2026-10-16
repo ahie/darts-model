@@ -70,21 +70,21 @@ loss:
   # every (query, cell) pair, the cell embedding carrying the tip head's
   # features, the neck and the cell's position, the query shifting the hidden
   # layer and supplying the output weights. The landing point is a
-  # soft-argmax over the 5x5 cells around the argmax.
+  # soft-argmax over the 7x7 cells around the argmax.
   heatmap_readout: true
   heatmap_dim: 128
   heatmap_heads: 4
   heatmap_layers: 3
   heatmap_pixel_dim: 64
   heatmap_hidden: 64
-  heatmap_window: 2
+  heatmap_window: 3
   query_count: 3
   tip_heat_weight: 1.0
   tip_offset_weight: 1.0
   # Readout: Hungarian matching on confidence, the heatmap cross-entropy and
-  # the landing distance; KL to each matched dart's Gaussian (tip_sigma), L1
-  # in pixels on the window soft-argmax around the tip's own cell, and a
-  # confidence BCE.
+  # the landing distance; KL to each matched dart's Gaussian (tip_sigma); L1
+  # in pixels on the decoded landing point, for the queries whose argmax is
+  # within a cell of their tip; and a confidence BCE.
   query_cost_px: 0.1
   query_cost_conf: 1.0
   heatmap_cost_ce: 1.0
