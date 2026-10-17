@@ -358,6 +358,10 @@ class DenseDartConfig:
     #: What the queries cross-attend to: "coarse", the neck's stride-32
     #: level (32x32 at 1024), or "neck", its stride-8 output (128x128).
     heatmap_memory: str = "coarse"
+    #: Add the dense landing votes -- every stride-8 cell's predicted landing
+    #: point, splatted onto the tip grid by foreground score -- to the cell
+    #: embedding, so a hidden tip has evidence at its own location.
+    heatmap_votes: bool = False
     #: Channels of the per-cell embedding: the tip head's features, the neck
     #: and the cell's position.
     heatmap_pixel_dim: int = 64

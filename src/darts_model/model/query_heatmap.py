@@ -43,6 +43,14 @@ features:
   cross-entropy and the decoded landing distance.
 
 Coinciding tips need nothing special: two queries may peak on the same cell.
+
+With ``heatmap_votes``, the cell embedding also reads a vote map: every
+stride-8 cell's predicted landing point, splatted onto the tip grid and
+weighted by its foreground score, as Hough votes. A hidden tip shows nothing
+at its own cell -- the tip head sees no tip there -- and its evidence lies
+along the visible shaft, whose cells each say where their tip is; the vote
+map puts that evidence at the tip's own location, where a query's heatmap
+can light up.
 """
 from __future__ import annotations
 
@@ -77,6 +85,32 @@ def local_softargmax(flat: torch.Tensor, cy: torch.Tensor, cx: torch.Tensor,
     p = v.softmax(-1)
     return torch.stack(((p * (xx.to(p.dtype) + 0.5)).sum(-1),
                         (p * (yy.to(p.dtype) + 0.5)).sum(-1)), -1)
+
+
+def vote_map(points: torch.Tensor, weight: torch.Tensor,
+             hw: tuple[int, int]) -> torch.Tensor:
+    """Points splatted bilinearly onto a grid, each carrying its weight.
+
+    ``points`` (B, 2, ...) normalised (x, y); ``weight`` (B, ...). Returns
+    (B, 1, h, w), cell centres at +0.5; weight falling off the grid is
+    dropped.
+    """
+    h, w = hw
+    b = int(points.shape[0])
+    x = points[:, 0].reshape(b, -1) * w - 0.5
+    y = points[:, 1].reshape(b, -1) * h - 0.5
+    wt = weight.reshape(b, -1)
+    x0, y0 = x.floor(), y.floor()
+    fx, fy = x - x0, y - y0
+    acc = wt.new_zeros(b, h * w)
+    for dx, dy, share in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
+                          (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+        xi, yi = (x0 + dx).long(), (y0 + dy).long()
+        inside = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        index = yi.clamp(0, h - 1) * w + xi.clamp(0, w - 1)
+        acc.scatter_add_(1, index, torch.where(inside, wt * share,
+                                               torch.zeros_like(wt)))
+    return acc.view(b, 1, h, w)
 
 
 def gaussian_targets(ends: torch.Tensor, mask: torch.Tensor,
@@ -116,6 +150,7 @@ class HeatmapReadout(nn.Module):
         self.pixel_tip = nn.Conv2d(cfg.tip_head_width, p, 1)
         self.pixel_neck = nn.Conv2d(cfg.head_width, p, 1)
         self.pixel_pos = nn.Linear(2 * 2 * POSITION_OCTAVES, p)
+        self.pixel_votes = (nn.Conv2d(1, p, 1) if cfg.heatmap_votes else None)
         # 3x3: a cell's sub-cell position relative to a tip is read from its
         # neighbourhood, as the tip head's own offset conv reads it.
         self.pixel_out = nn.Conv2d(p, p, 3, padding=1)
@@ -145,7 +180,7 @@ class HeatmapReadout(nn.Module):
         return self._forward(out)
 
     def _forward(self, out: dict) -> dict:
-        from darts_model.model.detector import decode_boxes
+        from darts_model.model.detector import cell_centres, decode_boxes
 
         cfg = self.cfg
         neck, feat = out["neck"], out["tip_features"]
@@ -175,6 +210,14 @@ class HeatmapReadout(nn.Module):
         pixel = (self.pixel_tip(feat) + pos.permute(2, 0, 1).unsqueeze(0)
                  + F.interpolate(self.pixel_neck(neck), size=(h, w),
                                  mode="bilinear", align_corners=False))
+        if self.pixel_votes is not None:
+            # Dense landing votes, log-compressed: a dart's ~70 cells pile
+            # onto a few tip cells.
+            fh, fw = (int(s) for s in out["fg_logits"].shape[-2:])
+            centres = cell_centres(fh, fw, feat.device)[None]
+            votes = vote_map(centres + out["tip_offset"],
+                             torch.sigmoid(out["fg_logits"]), (h, w))
+            pixel = pixel + self.pixel_votes(torch.log1p(votes))
         pixel = self.pixel_out(F.gelu(pixel)).flatten(2)          # (B, P, h*w)
 
         hidden = F.gelu(self.cell_hidden(pixel).unsqueeze(1)

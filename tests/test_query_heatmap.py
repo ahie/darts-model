@@ -175,3 +175,23 @@ def test_the_queries_can_attend_to_the_stride_8_neck():
     assert r["tip"].shape == (2, lit.config.query_count, 2)
     with pytest.raises(ValueError, match="heatmap_memory"):
         _hcfg(heatmap_memory="fine")
+
+
+def test_votes_are_splatted_bilinearly_at_their_points():
+    from darts_model.model.query_heatmap import vote_map
+    # Two cells vote: one exactly on cell (3, 2)'s centre, one between four
+    # cells; a third votes off the grid and is dropped.
+    pts = torch.tensor([[[3.5 / 8, 5.0 / 8, 1.2], [2.5 / 8, 6.0 / 8, 0.5]]])
+    wt = torch.tensor([[1.0, 2.0, 7.0]])
+    v = vote_map(pts, wt, (8, 8))[0, 0]
+    assert torch.isclose(v[2, 3], torch.tensor(1.0))
+    assert torch.allclose(v[5:7, 4:6], torch.full((2, 2), 0.5))
+    assert torch.isclose(v.sum(), torch.tensor(3.0))
+
+
+def test_the_readout_runs_with_the_vote_map():
+    torch.manual_seed(0)
+    lit = DenseDartLitModule(_hcfg(heatmap_votes=True)).eval()
+    with torch.no_grad():
+        r = lit.model.read_darts(lit.model(_batch()["image"].float()))
+    assert r["tip"].shape == (2, lit.config.query_count, 2)
