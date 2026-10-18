@@ -362,6 +362,11 @@ class DenseDartConfig:
     #: point, splatted onto the tip grid by foreground score -- to the cell
     #: embedding, so a hidden tip has evidence at its own location.
     heatmap_votes: bool = False
+    #: Per-query votes: each query's soft ownership of the stride-8 cells,
+    #: supervised by the instance map, weights their landing votes into a
+    #: vote map of its own, read by its heatmap.
+    heatmap_query_votes: bool = False
+    heatmap_member_weight: float = 0.5
     #: Channels of the per-cell embedding: the tip head's features, the neck
     #: and the cell's position.
     heatmap_pixel_dim: int = 64
@@ -1410,7 +1415,8 @@ class DenseDartLitModule(L.LightningModule):
             losses.update(hl)
             total = (total + cfg.heatmap_conf_weight * hl["h_conf"]
                      + cfg.heatmap_kl_weight * hl["h_kl"]
-                     + cfg.heatmap_l1_weight * hl["h_l1"])
+                     + cfg.heatmap_l1_weight * hl["h_l1"]
+                     + cfg.heatmap_member_weight * hl.get("h_member", 0.0))
             if stage == "val":
                 self._gt_seed_err.append(tip_px.cpu())
                 self._hm_on_peak.append(hs["on_peak"].cpu())

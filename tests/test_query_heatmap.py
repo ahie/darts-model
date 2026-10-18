@@ -195,3 +195,44 @@ def test_the_readout_runs_with_the_vote_map():
     with torch.no_grad():
         r = lit.model.read_darts(lit.model(_batch()["image"].float()))
     assert r["tip"].shape == (2, lit.config.query_count, 2)
+
+
+def test_membership_is_supervised_onto_each_matched_query():
+    from darts_model.model.query_heatmap import member_loss
+    inst = torch.tensor([[[1, 1, 0], [2, 0, 0]]])            # dart 0: two cells; dart 1: one
+    batch = {"instance": inst}
+    match = (torch.tensor([0, 0]), torch.tensor([2, 0]), torch.tensor([0, 1]))
+    member = torch.zeros(1, 3, 6)
+    # Confident and right: dart 0's cells to query 2, dart 1's to query 0.
+    member[0, 2, 0:2] = 20.0
+    member[0, 0, 3] = 20.0
+    assert float(member_loss(member, batch, match, torch.tensor(0.0))) < 1e-6
+    # Uniform ownership costs log(3) per supervised cell.
+    loss = member_loss(torch.zeros(1, 3, 6), batch, match, torch.tensor(0.0))
+    assert torch.isclose(loss, torch.log(torch.tensor(3.0)))
+
+
+def test_per_query_votes_train_end_to_end():
+    torch.manual_seed(0)
+    lit = DenseDartLitModule(_hcfg(heatmap_votes=True, heatmap_query_votes=True))
+    lit.train()
+    lit.log = lambda *a, **k: None
+    batch = _batch()
+    opt = torch.optim.Adam(lit.parameters(), lr=3e-3)
+    for _ in range(400):
+        loss = lit._step(batch, "train")
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    lit.eval()
+    with torch.no_grad():
+        out = lit.model(batch["image"].float())
+        r = lit.model.read_darts(out)
+        _, _, _, stats = heatmap_losses(r, batch, lit.config, 256.0)
+    assert bool(stats["on_peak"].all())
+    for b in range(2):
+        keep = r["score"][b] >= lit.config.query_conf_threshold
+        assert int(keep.sum()) == 2
+        gt = batch["dart_ends"][b, :2, 0:2] * 256
+        tips = r["tip"][b][keep] * 256
+        assert float(torch.cdist(gt, tips).amin(1).max()) < 1.5

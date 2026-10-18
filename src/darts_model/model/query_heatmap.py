@@ -51,6 +51,15 @@ at its own cell -- the tip head sees no tip there -- and its evidence lies
 along the visible shaft, whose cells each say where their tip is; the vote
 map puts that evidence at the tip's own location, where a query's heatmap
 can light up.
+
+With ``heatmap_query_votes``, each query also gets votes of its own. Tips in a
+tight group look alike at their cells; which dart a tip belongs to is told by
+its shaft, which is easy to separate at stride 8. So each query scores every
+stride-8 cell, a softmax across the queries makes that a soft owner per cell,
+and each cell's landing vote is splatted for each query weighted by its
+foreground score and that query's share of it. The query's own vote map enters
+the (query, cell) MLP. Membership is supervised: the cells of a matched
+query's dart, in the ground-truth instance map, should belong to that query.
 """
 from __future__ import annotations
 
@@ -151,6 +160,12 @@ class HeatmapReadout(nn.Module):
         self.pixel_neck = nn.Conv2d(cfg.head_width, p, 1)
         self.pixel_pos = nn.Linear(2 * 2 * POSITION_OCTAVES, p)
         self.pixel_votes = (nn.Conv2d(1, p, 1) if cfg.heatmap_votes else None)
+        self.member_cell = self.member_query = self.query_votes = None
+        if cfg.heatmap_query_votes:
+            self.member_cell = nn.Linear(cfg.head_width, d)
+            self.member_pos = nn.Linear(2 * 2 * POSITION_OCTAVES, d)
+            self.member_query = nn.Linear(d, d)
+            self.query_votes = nn.Linear(1, cfg.heatmap_hidden)
         # 3x3: a cell's sub-cell position relative to a tip is read from its
         # neighbourhood, as the tip head's own offset conv reads it.
         self.pixel_out = nn.Conv2d(p, p, 3, padding=1)
@@ -220,8 +235,27 @@ class HeatmapReadout(nn.Module):
             pixel = pixel + self.pixel_votes(torch.log1p(votes))
         pixel = self.pixel_out(F.gelu(pixel)).flatten(2)          # (B, P, h*w)
 
-        hidden = F.gelu(self.cell_hidden(pixel).unsqueeze(1)
-                        + self.query_hidden(q).unsqueeze(-1))     # (B, Q, H, h*w)
+        pre = (self.cell_hidden(pixel).unsqueeze(1)
+               + self.query_hidden(q).unsqueeze(-1))              # (B, Q, H, h*w)
+        member = None
+        if self.member_cell is not None:
+            fh, fw = (int(s) for s in neck.shape[-2:])
+            cy8 = (torch.arange(fh, device=neck.device, dtype=neck.dtype) + 0.5) / fh
+            cx8 = (torch.arange(fw, device=neck.device, dtype=neck.dtype) + 0.5) / fw
+            g8 = torch.stack(torch.meshgrid(cx8, cy8, indexing="xy"), -1).view(-1, 2)
+            cells8 = (self.member_cell(neck.flatten(2).transpose(1, 2))
+                      + self.member_pos(_fourier(g8, POSITION_OCTAVES)))  # (B, N, d)
+            member = (self.member_query(q) @ cells8.transpose(1, 2)
+                      / math.sqrt(int(q.shape[-1])))                # (B, Q, N)
+            share = member.softmax(1)
+            nq = int(q.shape[1])
+            centres = cell_centres(fh, fw, feat.device)[None]
+            points = (centres + out["tip_offset"]).flatten(2)       # (B, 2, N)
+            wt = torch.sigmoid(out["fg_logits"]).flatten(1).unsqueeze(1) * share
+            own = vote_map(points.unsqueeze(1).expand(-1, nq, -1, -1).reshape(b * nq, 2, -1),
+                           wt.reshape(b * nq, -1), (h, w)).view(b, nq, h * w)
+            pre = pre + self.query_votes(torch.log1p(own).unsqueeze(-1)).permute(0, 1, 3, 2)
+        hidden = F.gelu(pre)
         wout = self.query_out(q)                                  # (B, Q, H + 1)
         nh = int(hidden.shape[2])
         heat = (torch.einsum("bqh,bqhk->bqk", wout[..., :nh], hidden)
@@ -260,6 +294,7 @@ class HeatmapReadout(nn.Module):
             "direction": at_parent(dec["direction"]),
             "extent": at_parent(dec["extent"]),
             "heat_logits": heat,
+            "member_logits": member,                              # (B, Q, N) or None
             "cell": torch.stack((cx, cy), -1),                    # (B, Q, 2)
             "grid_size": (h, w),
         }
@@ -295,6 +330,23 @@ def match_heatmaps(pred: dict, ce: torch.Tensor, gt_tip: torch.Tensor,
     return t(fb), t(qb), t(db)
 
 
+def member_loss(member: torch.Tensor, batch: dict, match, zero) -> torch.Tensor:
+    """Cross-entropy over the queries of each stride-8 cell of a matched dart
+    belonging to that dart's query; cells of no dart, or of an unmatched one,
+    take no loss. ``member`` (B, Q, N) logits."""
+    f, q, d = match
+    inst = batch["instance"].reshape(int(batch["instance"].shape[0]), -1)  # (B, N)
+    target = torch.full_like(inst, -1)
+    for fi, qi, di in zip(f.tolist(), q.tolist(), d.tolist()):
+        target[fi][inst[fi] == di + 1] = qi
+    keep = target >= 0
+    if not bool(keep.any()):
+        return zero
+    logp = member.float().log_softmax(1)                                   # (B, Q, N)
+    picked = torch.gather(logp, 1, target.clamp(min=0).unsqueeze(1))[:, 0]
+    return -(picked[keep]).mean()
+
+
 def heatmap_losses(pred: dict, batch: dict, cfg, scale: float):
     """The readout's losses, the matched landing errors in pixels, the
     matching, and per-pair statistics.
@@ -308,6 +360,10 @@ def heatmap_losses(pred: dict, batch: dict, cfg, scale: float):
     query peaking elsewhere is left to the KL and the matching, and a window
     placed around the tip instead would measure the shared features' shape
     there, not the query's peak.
+
+    ``h_member`` (with ``heatmap_query_votes``): the cross-entropy, over the
+    queries, of each cell of a matched dart -- by the ground-truth instance
+    map -- belonging to the query matched to it.
 
     The statistics, per matched pair: ``on_peak`` (the argmax is within a
     cell of the tip) and both decodes' errors in pixels, ``soft_px`` and
@@ -325,6 +381,9 @@ def heatmap_losses(pred: dict, batch: dict, cfg, scale: float):
     conf[f, q] = 1.0
     losses = {"h_conf": F.binary_cross_entropy_with_logits(pred["logit"], conf)}
     zero = pred["logit"].sum() * 0.0
+    member = pred.get("member_logits")
+    if member is not None:
+        losses["h_member"] = member_loss(member, batch, (f, q, d), zero)
     if not f.numel():
         losses.update(h_kl=zero, h_l1=zero)
         empty = zero.new_zeros(0)
