@@ -128,6 +128,10 @@ them, at the intended framing (below).
 | `detector_tips.yaml` | a stride-8 tip heatmap with Hough | — | not trained |
 | `detector_tips4.yaml` | a stride-4 tip heatmap whose peaks go to the Hough detections one-to-one (Hungarian, 40 px gate) | validation 2.89; held-out 2.77 | trained |
 | `detector_readout*.yaml` | learned queries over stride-4 tokens carrying the tip heatmap, on the frozen `detector_tips4` model | validation 3.13; held-out 3.65 soft, 3.56 hard | trained |
+| `detector_heatmaps.yaml` | one heatmap per learned query over the stride-4 tip grid, Hungarian-matched and trained by KL to each dart's Gaussian; the queries attend to the neck's stride-32 level; on the frozen `detector_tips4` model | validation 3.27; held-out 4.21 | trained |
+| `detector_heatmaps_neck8.yaml` | the same, the queries attending to the neck's stride-8 output | validation 3.25; held-out 4.10 | trained |
+| `detector_heatmaps_votes.yaml` | `detector_heatmaps.yaml` plus the dense landing votes in the cell embedding | validation 3.45; held-out 4.08 | trained |
+| `detector_heatmaps_qvotes.yaml` | the votes plus per-query votes, from each query's ownership of the stride-8 cells | validation 3.18; held-out 3.99 | trained |
 
 ### Held-out results at the intended framing
 
@@ -156,6 +160,10 @@ are compared in millimetres on the board, as the notes below do.
 | Token readout, soft (`detector_readout*.yaml`) | 1.56 | 3.65 | 4.44 | 4.03 | 2.36 | 11.20 |
 | Token readout, hard (`detector_readout*.yaml`) | 1.41 | 3.56 | 4.15 | 4.09 | 2.25 | 13.01 |
 | YOLO26s-pose baseline (see below) | 2.15 | 4.55 | 6.99 | 4.01 | 2.15 | **7.97** |
+| Query heatmaps, stride-32 queries (`detector_heatmaps.yaml`) | 1.21 | 4.21 | 5.76 | 4.79 | 1.76 | 18.42 |
+| Query heatmaps, stride-8 queries (`detector_heatmaps_neck8.yaml`) | 1.21 | 4.10 | 5.68 | 4.03 | 2.23 | 17.10 |
+| Query heatmaps + votes (`detector_heatmaps_votes.yaml`) | 1.20 | 4.08 | 6.02 | 4.09 | 1.66 | 13.79 |
+| Query heatmaps + per-query votes (`detector_heatmaps_qvotes.yaml`) | 1.21 | 3.99 | 5.55 | 4.33 | 1.96 | 14.57 |
 
 Detection. A predicted dart is correct when it is matched, one-to-one, to a
 ground-truth dart within 40 px; FP counts the rest, over the 421 frames.
@@ -168,6 +176,10 @@ The penalised error above charges misses but not false positives.
 | Token readout, soft (`detector_readout*.yaml`) | **99.1%** | 98.4% | 14 | **0.6%** | **1.9%** |
 | Token readout, hard (`detector_readout*.yaml`) | 99.0% | 98.3% | 15 | **0.6%** | 3.8% |
 | YOLO26s-pose baseline (see below) | 95.9% | **99.8%** | **2** | 9.3% | 3.8% |
+| Query heatmaps, stride-32 queries (`detector_heatmaps.yaml`) | 97.0% | 96.3% | 33 | 3.3% | 22.6% |
+| Query heatmaps, stride-8 queries (`detector_heatmaps_neck8.yaml`) | 96.9% | 96.9% | 27 | 3.6% | 18.9% |
+| Query heatmaps + votes (`detector_heatmaps_votes.yaml`) | 96.9% | 96.9% | 27 | 4.2% | 11.3% |
+| Query heatmaps + per-query votes (`detector_heatmaps_qvotes.yaml`) | 97.4% | 97.3% | 24 | 3.0% | 11.3% |
 
 Scoring. The share of ground-truth darts whose predicted landing point
 falls in the right scoring zone, ring and segment, mapped to the board
@@ -189,6 +201,10 @@ show the same detectors under ordinary scatter.
 | Token readout, soft (`detector_readout*.yaml`) | 87.6% | 80.2% | 95.9% | 64.2% | 91.0% |
 | Token readout, hard (`detector_readout*.yaml`) | 88.4% | 82.0% | 95.0% | 62.3% | 91.3% |
 | YOLO26s-pose baseline (see below) | 84.0% | 74.2% | 92.6% | 73.6% | 87.8% |
+| Query heatmaps, stride-32 queries (`detector_heatmaps.yaml`) | 87.3% | 79.6% | 96.7% | 52.8% | 90.3% |
+| Query heatmaps, stride-8 queries (`detector_heatmaps_neck8.yaml`) | 88.1% | 82.6% | 95.5% | 52.8% | 90.2% |
+| Query heatmaps + votes (`detector_heatmaps_votes.yaml`) | 87.9% | 79.9% | 96.3% | 60.4% | 90.5% |
+| Query heatmaps + per-query votes (`detector_heatmaps_qvotes.yaml`) | 88.0% | 82.0% | 95.9% | 60.4% | 90.5% |
 
 Strengths and weaknesses:
 
@@ -225,6 +241,28 @@ Strengths and weaknesses:
   not run on the Neural Engine.
   Learned corrections on top of the pointed-at estimates contributed about
   0.2 px.
+- **Query heatmaps.** The darts are three slots out of the graph -- a landing
+  point and a confidence each -- with no Hough voting, no assignment and
+  nothing to port to an app but a threshold. Each plain learned query
+  attends to the neck and draws its own heatmap over the stride-4 tip grid
+  through a small MLP over every (query, cell) pair, the cell embedding
+  carrying the tip head's features, the neck and the cell's position; the
+  landing point is a soft-argmax over the 7x7 cells around the heatmap's
+  argmax. As precise as the tip peaks where a tip is visible (1.21 px
+  median), learned deduplication (24-33 spurious darts against 57), and the
+  dense dart heads can be left out of the graph (`--prune-dense`). Two
+  weaknesses: tight clusters, where tips look alike at their cells and about
+  a seventh of matched queries peak on a neighbour's tip (5.5-6.0 px against
+  3.8); and hidden tips, which show nothing at their own cell (18.9-22.6%
+  missed). Attending to the stride-8 neck instead of the stride-32 level
+  changed neither, for +1.86 GMAC. Adding the dense landing votes to the
+  cell embedding puts a hidden tip's evidence -- its shaft's cells saying
+  where their tip is -- at its location, halving the misses (11.3%), and
+  per-query votes, from each query's ownership of the stride-8 cells,
+  helped clusters a little (5.55); but votes read the dense heads, so they
+  cannot be pruned. Readout cost: 3.2 GMAC with stride-32 queries, 5.1 with
+  stride-8, 3.6 with per-query votes; the dense dart heads it can replace
+  are 5.0.
 - **YOLO26s-pose baseline.** An off-the-shelf comparison, not part of this
   package: Ultralytics' COCO-pretrained `yolo26s-pose` (10.6M parameters)
   fine-tuned for 100 epochs with its default settings on 20,000 fixed
@@ -244,11 +282,15 @@ rendered, and under uniform placement):
 
 | Readout | penalised | median | recall | FP | scoring | uniform placement |
 |---|---|---|---|---|---|---|
-| Hough (`detector.yaml`) | 4.44 | 2.52 | 98.0% | 68 | 84.3% | 88.9% |
-| Hough + tip peaks, Hungarian (`detector_tips4.yaml`) | **3.12** | **1.16** | 98.2% | 95 | **89.5%** | **93.0%** |
-| Token readout, soft (`detector_readout*.yaml`) | 3.35 | 1.34 | **98.7%** | 27 | 88.4% | 92.4% |
-| Token readout, hard (`detector_readout*.yaml`) | 3.32 | 1.24 | **98.7%** | 26 | 88.9% | 92.0% |
-| YOLO26s-pose baseline | 4.17 | 1.92 | 95.9% | **4** | 85.6% | 91.5% |
+| Hough (`detector.yaml`) | 4.44 | 2.52 | 98.0% | 68 | 84.3% | 87.5% |
+| Hough + tip peaks, Hungarian (`detector_tips4.yaml`) | **3.12** | **1.16** | 98.2% | 95 | **89.5%** | **91.7%** |
+| Token readout, soft (`detector_readout*.yaml`) | 3.35 | 1.34 | **98.7%** | 27 | 88.4% | 90.7% |
+| Token readout, hard (`detector_readout*.yaml`) | 3.32 | 1.24 | **98.7%** | 26 | 88.9% | 91.4% |
+| YOLO26s-pose baseline | 4.17 | 1.92 | 95.9% | **4** | 85.6% | 88.3% |
+| Query heatmaps, stride-32 queries (`detector_heatmaps.yaml`) | 3.77 | 1.20 | 97.7% | 61 | 87.7% | 90.0% |
+| Query heatmaps, stride-8 queries (`detector_heatmaps_neck8.yaml`) | 3.87 | 1.20 | 97.3% | 57 | 87.3% | 89.8% |
+| Query heatmaps + votes (`detector_heatmaps_votes.yaml`) | 3.78 | 1.21 | 97.4% | 62 | 87.9% | 90.0% |
+| Query heatmaps + per-query votes (`detector_heatmaps_qvotes.yaml`) | 3.71 | 1.20 | 97.7% | 48 | 88.0% | 90.2% |
 
 ## Trained weights
 
@@ -301,6 +343,18 @@ The config must be the one the checkpoint was trained with (see
 `--precision fp32`: under fp16 its slots can flip between near-equal
 options, and the exporter's comparison against torch fails.
 
+`--prune-dense` (CoreML) leaves the dense dart heads out of the graph -- not
+computed, not exported -- for a query heatmap readout without votes, which
+reads none of them: the outputs are the board corners and the slots
+(`kp_xy`, `kp_conf`, `slot_score`, `slot_tip`, `slot_tip_hard`). A readout
+whose votes are the dense heads' outputs is refused. The LiteRT exporter
+does not prune yet: it resolves its output mapping through the dense
+planes. In a pruned graph none of the readout's ops follow the dense
+`topk`, which is what keeps them at fp32 under the default fp16, so the
+readout runs at fp16; it passes the exporter's comparison, but if a
+device shows slots flipping between neighbouring tips, export with
+`--precision fp32`.
+
 Both exporters run the converted model and the torch model on one frame and
 compare them before writing anything. `--sample` is that frame: an image
 showing darts in a board, centre-cropped and resized to the input size, as
@@ -336,7 +390,7 @@ y down; multiply by S for pixels. K = `topk` (1024, fewer for inputs under
 | `kp_xy` | (1, 40, 2) | board corner positions |
 | `kp_conf` | (1, 40) | board corner confidences |
 
-These eight are common to every variant. The variants add outputs after
+These eight are common to every variant except a pruned one. The variants add outputs after
 them, and read their darts differently:
 
 | Variant | Further outputs | Darts |
@@ -344,6 +398,8 @@ them, and read their darts differently:
 | Hough (`detector.yaml`) | — | the [dart readout](#dart-readout) below |
 | Hough + tip peaks (`detector_tips4.yaml`) | `tip_xy` (1, P, 2), `tip_score` (1, P) | the dart readout, then [tip assignment](#tip-assignment) |
 | Token readout (`detector_readout_long.yaml`) | `slot_score` (1, Q), `slot_tip` (1, Q, 2), `slot_flight` (1, Q, 2), `slot_tip_hard` (1, Q, 2), `tip_xy`, `tip_score` | the [slots](#slots), no readout in the app |
+| Query heatmaps (`detector_heatmaps*.yaml`) | as the token readout | the [slots](#slots); Hough over the dense planes too |
+| Query heatmaps, pruned (`--prune-dense`) | **instead of** the eight above: `kp_xy`, `kp_conf`, `slot_score`, `slot_tip`, `slot_tip_hard` | the [slots](#slots) only; the metadata says `pruned: true` |
 
 P = 16 tip peaks, Q = 3 slots; both are in `output_shapes`.
 
@@ -398,14 +454,20 @@ receives a peak takes it as its landing point; one that receives none keeps
 its own. Two darts whose tips coincide share a single peak, so only one of
 them gets it.
 
-<a id="slots"></a>**Slots** (token readout; the metadata's `darts` field).
-Slot i is a dart when `slot_score[i]` ≥ `min_score`; its landing point is
-`slot_tip[i]` and its flight end `slot_flight[i]`. `slot_tip_hard[i]` is the
-same dart's landing point taken from the readout's single highest-weighted
-option instead of the blend it was trained with (held-out: 3.56 against
-3.65, see above). No Hough voting or assignment is needed; the per-cell
-outputs and the tip peaks remain for debugging. At most Q darts are read
-per frame.
+<a id="slots"></a>**Slots** (token readout and query heatmaps; the metadata's
+`darts` field). Slot i is a dart when `slot_score[i]` ≥ `min_score`; its
+landing point is `slot_tip[i]` and its flight end, when exported,
+`slot_flight[i]`. `slot_tip_hard[i]` is the same dart's landing point read
+another way, as `darts.hard_note` says: for the token readout the single
+highest-weighted option instead of the blend it was trained with (held-out:
+3.56 against 3.65, see above); for the query heatmaps the heatmap's argmax
+cell plus the tip head's sub-cell offset instead of the window soft-argmax
+(1.13 against 1.21 px median, 4.14-4.29 against 4.08-4.21 penalised). No
+Hough voting or assignment is needed; the per-cell outputs and the tip
+peaks, where exported, remain for debugging. At most Q darts are read per
+frame. A pruned model reports no flight end; an app that compares the
+flight -- a tracker telling a tight group from one dart seen twice, say --
+can stand the tip in for it.
 
 **Board corners**: `kp_xy[i]` is corner `kp_names[i]`, the 40 double-ring
 corners in `BOARD_KEYPOINT_NAMES[41:81]` (`src/darts_model/board_geometry.py`):
