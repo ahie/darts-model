@@ -236,3 +236,68 @@ def test_per_query_votes_train_end_to_end():
         gt = batch["dart_ends"][b, :2, 0:2] * 256
         tips = r["tip"][b][keep] * 256
         assert float(torch.cdist(gt, tips).amin(1).max()) < 1.5
+
+
+def _exportable(**kw):
+    cfg = _hcfg(head_width=16, head_depth=1, kp_head_width=16, kp_head_depth=1, **kw)
+    torch.manual_seed(0)
+    lit = DenseDartLitModule(cfg).eval()
+    with torch.no_grad():
+        for p in lit.model.parameters():
+            p.add_(torch.randn_like(p) * 0.05)
+        lit.model.fg_head.bias.fill_(0.0)
+    return cfg, lit
+
+
+def test_the_heatmap_readout_exports_its_slots():
+    from darts_model.export.common import effective_topk, output_names
+    from darts_model.export.coreml import ExportWrapper
+    cfg, lit = _exportable()
+    wrapper = ExportWrapper(lit.model, topk=effective_topk(256, 8)).eval()
+    image = torch.randint(0, 256, (1, 3, 256, 256)).float()
+    with torch.no_grad():
+        outs = dict(zip(output_names(cfg), wrapper(image)))
+        r = lit.model.read_darts(lit.model((image - wrapper.norm_mean)
+                                           / wrapper.norm_std))
+    assert output_names(cfg)[8:12] == ["slot_score", "slot_tip", "slot_flight",
+                                      "slot_tip_hard"]
+    assert torch.allclose(outs["slot_tip"], r["tip"])
+    assert torch.allclose(outs["slot_tip_hard"], r["tip_hard"])
+
+
+def test_a_pruned_export_reads_the_same_darts_without_the_dense_heads():
+    from darts_model.export.common import (
+        PRUNED_OUTPUTS, effective_topk, output_names, readout_contract,
+    )
+    from darts_model.export.coreml import ExportWrapper
+    cfg, lit = _exportable()
+    image = torch.randint(0, 256, (1, 3, 256, 256)).float()
+    full = ExportWrapper(lit.model, topk=effective_topk(256, 8)).eval()
+    with torch.no_grad():
+        ref = dict(zip(output_names(cfg), full(image)))
+    pruned = ExportWrapper(lit.model, topk=effective_topk(256, 8),
+                           prune_dense=True).eval()
+    with torch.no_grad():
+        got = dict(zip(output_names(cfg, pruned=True), pruned(image)))
+        traced = torch.jit.trace(pruned, image, strict=False)(image)
+        exported = torch.export.export(pruned, (image,)).module()(image)
+    assert list(got) == PRUNED_OUTPUTS
+    for name in ("kp_xy", "kp_conf", "slot_score", "slot_tip", "slot_tip_hard"):
+        assert torch.allclose(got[name], ref[name], atol=1e-6), name
+    for a, b, c in zip(got.values(), traced, exported):
+        assert torch.allclose(a, b, atol=1e-5) and torch.allclose(a, c, atol=1e-5)
+    # The dense heads are not run at all, not merely left unread.
+    with torch.no_grad():
+        out = lit.model((image - pruned.norm_mean) / pruned.norm_std)
+    assert "fg_logits" not in out and "tip_offset" not in out
+    shapes = readout_contract(cfg, 256, effective_topk(256, 8), pruned=True)
+    assert shapes["pruned"] is True
+    assert set(shapes["output_shapes"]) == set(PRUNED_OUTPUTS)
+
+
+def test_a_readout_that_votes_cannot_be_pruned():
+    from darts_model.export.common import ExportError
+    from darts_model.export.coreml import ExportWrapper
+    _, lit = _exportable(heatmap_votes=True)
+    with pytest.raises(ExportError, match="cannot be pruned"):
+        ExportWrapper(lit.model, topk=64, prune_dense=True)

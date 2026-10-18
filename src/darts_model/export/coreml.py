@@ -52,6 +52,7 @@ from darts_model.export.common import (
     load_checkpoint,
     readout_contract,
     require_export_heads,
+    require_prunable,
     verification_frame,
 )
 from darts_model.model.detector import slot_floor
@@ -108,10 +109,16 @@ class ExportWrapper(torch.nn.Module):
     """
 
     def __init__(self, model: torch.nn.Module, topk: int = TOPK,
-                 float_keypoints: bool = False) -> None:
+                 float_keypoints: bool = False, prune_dense: bool = False) -> None:
         super().__init__()
         require_export_heads(model.config)
+        if prune_dense:
+            require_prunable(model.config)
         self.model = model
+        # The model's own switch, so the pruned heads are not computed at all
+        # rather than computed and thrown away.
+        self.prune_dense = prune_dense
+        model.prune_dense = prune_dense
         self.topk = topk
         # See `_keypoints_float`. Off by default, so the CoreML export -- which
         # has no trouble with argmax and is already on devices -- is unchanged.
@@ -194,6 +201,8 @@ class ExportWrapper(torch.nn.Module):
 
     def forward(self, image: torch.Tensor):
         out = self.model((image - self.norm_mean) / self.norm_std)
+        if self.prune_dense:
+            return self._pruned(out)
 
         fg = out["fg_logits"]                       # (1, h, w)
         h, w = int(fg.shape[-2]), int(fg.shape[-1])
@@ -246,7 +255,8 @@ class ExportWrapper(torch.nn.Module):
                               cfg.tip_peak_count)
         if (getattr(self.model, "instance_head", None) is not None
                 or getattr(self.model, "query_head", None) is not None
-                or getattr(self.model, "token_readout", None) is not None):
+                or getattr(self.model, "token_readout", None) is not None
+                or getattr(self.model, "heatmap_readout", None) is not None):
             # The darts themselves: seeds picked, cells grouped and read in
             # the graph, so the app reads S slots instead of voting.
             darts = self.model.read_darts(out)
@@ -261,6 +271,15 @@ class ExportWrapper(torch.nn.Module):
         if peaks is not None:
             outs = outs + peaks
         return outs
+
+    def _pruned(self, out: dict):
+        """The board corners and the slots, with no dense dart plane."""
+        h, w = (int(s) for s in out["kp_logits"].shape[-2:])
+        kp_xy, kp_conf = (self._keypoints_float(out, h * w, h, w)
+                          if self.float_keypoints
+                          else self._keypoints_argmax(out, h * w, h, w))
+        darts = self.model.read_darts(out)
+        return (kp_xy, kp_conf, darts["score"], darts["tip"], darts["tip_hard"])
 
 
 def main() -> int:
@@ -278,6 +297,10 @@ def main() -> int:
                     help="an image showing darts in a board, to verify the "
                          "converted model against torch. Without it one frame "
                          "is rendered, which needs the renderer module.")
+    ap.add_argument("--prune-dense", action="store_true",
+                    help="leave out the dense dart heads and their outputs: "
+                         "only the board corners and the slots are exported. "
+                         "Needs a query heatmap readout without votes.")
     args = ap.parse_args()
     try:
         return export(args)
@@ -296,8 +319,9 @@ def export(args) -> int:
         print(f"  {size}px gives {topk} cells: K clamped from "
               f"{topk_for_stride(cfg.out_stride)}")
 
-    model = ExportWrapper(loaded.lit.model, topk=topk).eval()
-    names = output_names(cfg)
+    model = ExportWrapper(loaded.lit.model, topk=topk,
+                          prune_dense=args.prune_dense).eval()
+    names = output_names(cfg, pruned=args.prune_dense)
 
     # 0-255, which is what the WRAPPER takes -- it normalises internally, so
     # the reference and the converted model are fed what the app feeds them.
@@ -308,11 +332,19 @@ def export(args) -> int:
     for name, t in ref.items():
         print(f"  {name:<15} {tuple(t.shape)}")
     gate = float(cfg.fg_threshold)
-    kept = int((ref["dart_score"][0] >= gate).sum())
-    if kept < MIN_KEPT_CELLS:
-        raise ExportError(
-            f"the model keeps {kept} cells on the verification frame, too few "
-            f"to verify the conversion; pass --sample with darts in the board")
+    if args.prune_dense:
+        darts = int((ref["slot_score"][0] >= slot_floor(cfg)).sum())
+        if darts < 1:
+            raise ExportError(
+                "the model reads no dart on the verification frame, so the "
+                "conversion of its slots cannot be checked; pass --sample with "
+                "darts in the board")
+    else:
+        kept = int((ref["dart_score"][0] >= gate).sum())
+        if kept < MIN_KEPT_CELLS:
+            raise ExportError(
+                f"the model keeps {kept} cells on the verification frame, too few "
+                f"to verify the conversion; pass --sample with darts in the board")
 
     with torch.no_grad():
         traced = torch.jit.trace(model, example, strict=False)
@@ -374,8 +406,12 @@ def export(args) -> int:
                 f"uses_keypoint_weights in export/common.py, or export with "
                 f"--precision fp32.")
 
-    contract = readout_contract(cfg, size, topk)
+    contract = readout_contract(cfg, size, topk, pruned=args.prune_dense)
     mlmodel.short_description = (
+        "Dartboard readout: per-dart landing points and confidences in S "
+        "slots, plus 40 double-bed corners; dense heads pruned, so there is "
+        "nothing for Hough voting. See user_defined_metadata."
+        if args.prune_dense else
         "Dartboard readout: per-dart landing and flight points in S slots, "
         "plus the top-K cells and 40 double-bed corners; see "
         "user_defined_metadata." if output_names(cfg) != OUTPUTS else

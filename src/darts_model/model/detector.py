@@ -712,6 +712,11 @@ class DenseDartNet(nn.Module):
         #: Whether the per-dart readout reads the dense field detached; set
         #: per epoch by the training module (``readout_warmup_epochs``).
         self.readout_detached = False
+        #: Skip the dense dart trunk and heads -- fg, box, ends, embedding --
+        #: in the forward. For exporting a readout that reads none of them
+        #: (the query heatmap readout without votes): the tip head, the board
+        #: corners and the readout read the neck, so they are unaffected.
+        self.prune_dense = False
 
         # centre offset (2), (cos, sin) (2), log half-length, log half-width
         self.box_head = nn.Conv2d(cfg.head_width, 6, 3, padding=1)
@@ -782,10 +787,12 @@ class DenseDartNet(nn.Module):
                     align_corners=False)
 
         neck = x
-        x = self.head(x)
-        box = _fp32(self.box_head, x)
+        dense = not self.prune_dense
+        if dense:
+            x = self.head(x)
+            box = _fp32(self.box_head, x)
         out_ends = {}
-        if self.ends_head is not None:
+        if dense and self.ends_head is not None:
             e = _fp32(self.ends_head, x)
             out_ends = {"tip_offset": e[:, 0:2], "flight_offset": e[:, 2:4]}
         if self.token_readout is not None or self.heatmap_readout is not None:
@@ -796,9 +803,9 @@ class DenseDartNet(nn.Module):
             # The heatmap queries attend to the coarsest level: which dart a
             # query takes is the most global decision the readout makes.
             out_ends["neck_coarse"] = coarse
-        if self.embed_head is not None:
+        if dense and self.embed_head is not None:
             out_ends["embedding"] = _fp32(self.embed_head, x)   # (B, E, h, w)
-        if self.token_proj is not None:
+        if dense and self.token_proj is not None:
             t = (torch.cat((neck, x), 1) if self.config.token_inputs == "neck+trunk"
                  else x)
             t = t.detach() if self.readout_detached else t
@@ -828,6 +835,8 @@ class DenseDartNet(nn.Module):
                 "kp_logits": self.kp_head(k),              # (B, K, h, w)
                 "kp_offset": _fp32(self.kp_offset, k),     # (B, 2, h, w)
             }
+        if not dense:
+            return {**out_kp, **out_ends}
         return {
             **out_kp,
             **out_ends,
@@ -878,13 +887,14 @@ class DenseDartNet(nn.Module):
             own = ("tokens", "fine", "tip_logits", "tip_cell_offset",
                    "tip_features")
             out = {k: v if k in own else v.detach() for k, v in out.items()}
+        if self.heatmap_readout is not None:
+            # First: it reads no dense plane, so it also runs pruned.
+            return self.heatmap_readout(out)
         image_px = float(int(out["fg_logits"].shape[-1]) * cfg.out_stride)
         centre_scale = cfg.membership_centre_px / image_px
         if self.token_readout is not None:
             from darts_model.model.token_readout import gather_tokens
             return self.token_readout(gather_tokens(out, cfg.readout_tokens))
-        if self.heatmap_readout is not None:
-            return self.heatmap_readout(out)
         cand = gather_candidates(out, candidate_count(cfg.out_stride),
                                  centre_scale, cfg.context_radius)
         if self.query_head is not None:

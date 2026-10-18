@@ -61,12 +61,38 @@ TIP_OUTPUTS = [
 ]
 
 
-def output_names(cfg) -> list[str]:
+#: With the dense heads pruned (``prune_dense``): the board corners and the
+#: slots' landing points and confidences, nothing else.
+PRUNED_OUTPUTS = ["kp_xy", "kp_conf", "slot_score", "slot_tip",
+                  "slot_tip_hard"]
+
+
+def has_hard_slots(cfg) -> bool:
+    """Whether the readout exports a second landing point per slot."""
+    return bool(getattr(cfg, "token_readout", False)
+                or getattr(cfg, "heatmap_readout", False))
+
+
+def require_prunable(cfg) -> None:
+    """Pruning drops the dense dart heads; only a readout that reads none of
+    them can survive it."""
+    if not getattr(cfg, "heatmap_readout", False):
+        raise ExportError("--prune-dense needs a query heatmap readout "
+                          "(heatmap_readout): every other readout is the dense "
+                          "heads, or reads them")
+    if getattr(cfg, "heatmap_votes", False) or getattr(cfg, "heatmap_query_votes", False):
+        raise ExportError("--prune-dense: this readout's votes are the dense "
+                          "heads' landing points and foreground scores, so they "
+                          "cannot be pruned")
+
+
+def output_names(cfg, pruned: bool = False) -> list[str]:
     """The exported outputs for this config, in ExportWrapper's order."""
     from darts_model.model.detector import slot_count
+    if pruned:
+        return list(PRUNED_OUTPUTS)
     return (OUTPUTS + (SLOT_OUTPUTS if slot_count(cfg) else [])
-            + (HARD_SLOT_OUTPUTS if getattr(cfg, "token_readout", False)
-               else [])
+            + (HARD_SLOT_OUTPUTS if has_hard_slots(cfg) else [])
             + (TIP_OUTPUTS if getattr(cfg, "predict_tip_heatmap", False)
                else []))
 
@@ -287,8 +313,13 @@ def verification_frame(sample: str | None, size: int, raw: dict,
 # --------------------------------------------------------------------------
 
 def output_shapes(topk: int, num_keypoints: int, slots: int = 0,
-                  tip_peaks: int = 0, hard_slots: bool = False) -> dict[str, list[int]]:
+                  tip_peaks: int = 0, hard_slots: bool = False,
+                  pruned: bool = False) -> dict[str, list[int]]:
     k, nk = topk, num_keypoints
+    if pruned:
+        return {"kp_xy": [1, nk, 2], "kp_conf": [1, nk],
+                "slot_score": [1, slots], "slot_tip": [1, slots, 2],
+                "slot_tip_hard": [1, slots, 2]}
     shapes = {
         "dart_score": [1, k], "dart_centre": [1, k, 2],
         "dart_direction": [1, k, 2], "dart_extent": [1, k, 2],
@@ -305,7 +336,7 @@ def output_shapes(topk: int, num_keypoints: int, slots: int = 0,
     return shapes
 
 
-def readout_contract(cfg, size: int, topk: int) -> dict:
+def readout_contract(cfg, size: int, topk: int, pruned: bool = False) -> dict:
     """Everything an app needs to turn the outputs into detections.
 
     Written into the CoreML metadata and the LiteRT sidecar alike, so neither
@@ -346,8 +377,11 @@ def readout_contract(cfg, size: int, topk: int) -> dict:
         "output_shapes": output_shapes(
             topk, cfg.num_keypoints, slot_count(cfg),
             cfg.tip_peak_count if getattr(cfg, "predict_tip_heatmap", False)
-            else 0, bool(getattr(cfg, "token_readout", False))),
+            else 0, has_hard_slots(cfg), pruned),
     }
+    if pruned:
+        # Nothing for Hough to vote over: the darts are the slots.
+        contract["pruned"] = True
     if getattr(cfg, "predict_tip_heatmap", False):
         contract["tips"] = {
             "snap_score": float(cfg.tip_snap_score),
@@ -383,6 +417,11 @@ def readout_contract(cfg, size: int, topk: int) -> dict:
             contract["darts"]["hard_note"] = (
                 "slot_tip_hard[i] is the same dart's landing point read as the "
                 "tip pointer's single top option instead of its blend")
+        if getattr(cfg, "heatmap_readout", False):
+            contract["darts"]["hard_note"] = (
+                "slot_tip_hard[i] is the same dart's landing point read as its "
+                "heatmap's argmax cell plus the tip head's sub-cell offset, "
+                "instead of the window soft-argmax")
     return contract
 
 
@@ -474,6 +513,9 @@ def check_slots(ref: dict[str, np.ndarray], got: dict[str, np.ndarray],
     """
     failures = 0
     rs, gs = np.asarray(ref["slot_score"])[0], np.asarray(got["slot_score"])[0]
+    # The slots' positional outputs this export has: a pruned model has no
+    # flight, and not every readout has a second landing point.
+    planes = [n for n in ("slot_tip", "slot_flight", "slot_tip_hard") if n in ref]
     rk, gk = rs >= floor, gs >= floor
     log(f"  darts over {floor}: torch {int(rk.sum())}, converted {int(gk.sum())}")
     if rk.sum() != gk.sum():
@@ -484,7 +526,7 @@ def check_slots(ref: dict[str, np.ndarray], got: dict[str, np.ndarray],
     if not rt.shape[0]:
         return failures
     j = np.linalg.norm(rt[:, None] - gt[None], axis=-1).argmin(1)
-    for name in ("slot_tip", "slot_flight"):
+    for name in planes:
         a = np.asarray(ref[name])[0][rk]
         b = np.asarray(got[name])[0][gk][j]
         worst = float(np.linalg.norm(a - b, axis=-1).max()) * size
@@ -551,6 +593,9 @@ def check_against_reference(ref: dict[str, np.ndarray],
             f"moved {px:.2f}px: precision loss in the keypoint head")
         failures += 1
 
+    if "dart_score" not in ref:
+        # Pruned: no cells, only the slots.
+        return failures + check_slots(ref, got, size, slot_floor, px_limit, log)
     m = match_cells(ref, got, gate)
     log(f"  cells over {gate}: torch {m.kept_ref}, converted {m.kept_got}")
     # Cells right at the gate may cross it by rounding; a large difference is

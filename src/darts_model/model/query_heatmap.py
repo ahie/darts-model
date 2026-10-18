@@ -88,7 +88,9 @@ def local_softargmax(flat: torch.Tensor, cy: torch.Tensor, cx: torch.Tensor,
     yy = cy.unsqueeze(-1) + dy.flatten()                   # (..., K)
     xx = cx.unsqueeze(-1) + dx.flatten()
     inside = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
-    index = yy.clamp(0, h - 1) * w + xx.clamp(0, w - 1)
+    # .long(): index arithmetic traced through a divide reaches CoreML's
+    # gather as float, which it refuses.
+    index = (yy.clamp(0, h - 1) * w + xx.clamp(0, w - 1)).long()
     v = torch.gather(flat, -1, index)
     v = torch.where(inside, v, torch.full_like(v, -1e4))
     p = v.softmax(-1)
@@ -262,8 +264,8 @@ class HeatmapReadout(nn.Module):
                 / math.sqrt(nh) + wout[..., nh:])                 # (B, Q, h*w)
 
         index = heat.argmax(-1)                                   # (B, Q)
-        cy = torch.div(index, w, rounding_mode="floor")
-        cx = index - cy * w
+        cy = torch.div(index, w, rounding_mode="floor").long()
+        cx = (index - cy * w).long()
         size = torch.tensor([w, h], device=heat.device, dtype=heat.dtype)
         soft = local_softargmax(heat, cy, cx, (h, w), cfg.heatmap_window) / size
 
@@ -272,15 +274,27 @@ class HeatmapReadout(nn.Module):
         hard = (torch.stack((cx, cy), -1).to(heat.dtype) + 0.5
                 + at.transpose(1, 2)) / size
 
-        # The dense field's estimates at the tip cell's stride-8 parent.
-        fh, fw = (int(s) for s in out["fg_logits"].shape[-2:])
-        dec = decode_boxes(out, (fh, fw))
-        parent = ((cy * fh) // h) * fw + (cx * fw) // w
+        # The dense field's estimates at the tip cell's stride-8 parent; with
+        # the dense heads pruned there are none, and the flight is the tip.
+        if "fg_logits" in out:
+            fh, fw = (int(s) for s in out["fg_logits"].shape[-2:])
+            dec = decode_boxes(out, (fh, fw))
+            parent = (torch.div(cy * fh, h, rounding_mode="floor") * fw
+                      + torch.div(cx * fw, w, rounding_mode="floor")).long()
 
-        def at_parent(plane):                                     # (B, C, fh, fw)
-            c = int(plane.shape[1])
-            return torch.gather(plane.flatten(2), 2,
-                                parent.unsqueeze(1).expand(-1, c, -1)).transpose(1, 2)
+            def at_parent(name):                                  # (B, Q, C)
+                plane = dec[name]
+                c = int(plane.shape[1])
+                return torch.gather(plane.flatten(2), 2, parent.unsqueeze(1).expand(
+                    -1, c, -1)).transpose(1, 2)
+        else:
+            def at_parent(name):
+                if name in ("flight_point", "centre"):
+                    return soft
+                if name == "direction":
+                    return torch.cat((torch.ones_like(soft[..., :1]),
+                                      torch.zeros_like(soft[..., :1])), -1)
+                return torch.zeros_like(soft)
 
         logit = torch.cat([self.conf[j](q[:, j])
                            for j in range(int(q.shape[1]))], -1)
@@ -289,10 +303,10 @@ class HeatmapReadout(nn.Module):
             "score": torch.sigmoid(logit),
             "tip": soft,
             "tip_hard": hard,
-            "flight": at_parent(dec["flight_point"]),
-            "centre": at_parent(dec["centre"]),
-            "direction": at_parent(dec["direction"]),
-            "extent": at_parent(dec["extent"]),
+            "flight": at_parent("flight_point"),
+            "centre": at_parent("centre"),
+            "direction": at_parent("direction"),
+            "extent": at_parent("extent"),
             "heat_logits": heat,
             "member_logits": member,                              # (B, Q, N) or None
             "cell": torch.stack((cx, cy), -1),                    # (B, Q, 2)

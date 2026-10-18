@@ -296,6 +296,9 @@ def main() -> int:
                          "the refusal partitions the graph rather than "
                          "trimming its tail (2740ms against 226ms, measured). "
                          "TikatCore's DenseDecode finishes the job.")
+    ap.add_argument("--prune-dense", action="store_true",
+                    help="not supported by the LiteRT exporter yet; see the "
+                         "CoreML exporter")
     ap.add_argument("--keypoint-argmax", action="store_true",
                     help="spell the keypoint readout with argmax and gather, "
                          "as the CoreML export does. Only for a CPU-only "
@@ -330,6 +333,12 @@ def export(args) -> int:
         print(f"  {size}px gives {topk} cells: K clamped from "
               f"{topk_for_stride(cfg.out_stride)}")
     gate = float(cfg.fg_threshold)
+    if args.prune_dense:
+        # The output mapping is resolved by value through the per-cell planes
+        # (`resolve_outputs`), which a pruned model does not have.
+        raise ExportError("--prune-dense is not supported by the LiteRT "
+                          "exporter yet: its output mapping is resolved through "
+                          "the dense planes a pruned model drops")
 
     if args.raw_planes:
         """The graph stops at the planes; the device decodes them.
